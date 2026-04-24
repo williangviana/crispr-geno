@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crispr-geno"
+version = "0.1.0"
+description = "Genotype long-read CRISPR amplicon sequencing (Nanopore / PacBio)"
+requires-python = ">=3.9"
+dependencies = [
+    "pysam>=0.19",
+    "openpyxl>=3.1",
+]
+
+[project.scripts]
+crispr-geno = "crispr_geno.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
