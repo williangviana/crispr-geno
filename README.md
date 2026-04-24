@@ -116,4 +116,4 @@ In the `--output` directory:
 
 ## Out of scope
 
-No structural-variant or translocation calls (try CRISPRlungo), no base-editing-specific calls, no multi-amplicon multiplexing in one run.
+No structural-variant or translocation calls, no base-editing-specific calls, no multi-amplicon multiplexing in one run.
