@@ -18,23 +18,18 @@ echo "============================================"
 echo ""
 
 # --- Prompt for install location (works even when piped through bash) ---
-# Default is shown; user can press Enter, type a path, or type 'b' to open a
-# Finder folder-picker dialog.
+# User can press Enter for the default, or type 'b' to open a Finder picker.
 DEST=""
 if [ -r /dev/tty ]; then
     {
         printf "Where should crispr-geno be installed?\n"
         printf "  • Press Enter to use the default: %s\n" "$DEFAULT_DEST"
-        printf "  • Type a path to choose a custom location\n"
         printf "  • Type 'b' and press Enter to browse in Finder\n"
         printf "> "
     } > /dev/tty
     read USER_INPUT < /dev/tty || true
 
     case "$USER_INPUT" in
-        "")
-            DEST="$DEFAULT_DEST"
-            ;;
         b|B|browse|Browse)
             printf "Opening Finder...\n" > /dev/tty
             PARENT=$(osascript \
@@ -52,7 +47,7 @@ if [ -r /dev/tty ]; then
             fi
             ;;
         *)
-            DEST="$USER_INPUT"
+            DEST="$DEFAULT_DEST"
             ;;
     esac
 fi
