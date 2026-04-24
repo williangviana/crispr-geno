@@ -153,7 +153,7 @@ def sequence_xlsx(
             PatternFill("solid", start_color="B084CB")),
         ("SV:-Nbp/WT", "heterozygous large deletion between two cut sites",
             PatternFill("solid", start_color="D5A6BD")),
-        ("red border", "ambiguous call — a competing allele is present at ≥15% (check editing_rates.csv)",
+        ("ambiguous", "competing allele present at ≥15% — check editing_rates.csv (shown as a red border on the cell)",
             None),
     ]
     row_idx = 2
@@ -175,7 +175,7 @@ def sequence_xlsx(
     # Sizing for the legend columns
     ws.column_dimensions[ws.cell(1, buffer_col).column_letter].width = 3
     ws.column_dimensions[ws.cell(1, color_col).column_letter].width = 8
-    ws.column_dimensions[ws.cell(1, label_col).column_letter].width = 40
+    ws.column_dimensions[ws.cell(1, label_col).column_letter].width = 22
     ws.column_dimensions[ws.cell(1, meaning_col).column_letter].width = 75
 
     wb.save(xlsx)
