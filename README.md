@@ -20,7 +20,7 @@ reads can be any length from ~200 bp up to full amplicon + overhangs.
 Open Terminal and paste:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/williangviana/crispr-geno/main/install/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/williangviana/crispr-geno/stable/install/install.sh | bash
 ```
 
 You'll be prompted for an install location (default `~/crispr-geno`). The

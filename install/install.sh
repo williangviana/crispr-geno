@@ -1,12 +1,12 @@
 #!/bin/bash
 # crispr-geno — One-line installer (macOS)
-# Usage: curl -fsSL https://raw.githubusercontent.com/williangviana/crispr-geno/main/install/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/williangviana/crispr-geno/stable/install/install.sh | bash
 
 set -e
 
 APP_NAME="crispr-geno"
 REPO="williangviana/crispr-geno"
-BRANCH="${CRISPR_GENO_BRANCH:-main}"
+BRANCH="${CRISPR_GENO_BRANCH:-stable}"
 DEFAULT_DEST="$HOME/crispr-geno"
 
 trap 'echo ""; echo "ERROR: Installation failed at the step above."; echo "Please screenshot this output and send it for help."; exit 1' ERR

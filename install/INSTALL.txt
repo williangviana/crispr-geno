@@ -10,7 +10,7 @@ Open the Terminal and paste the command below:
 
 Mac
 ---
-curl -fsSL https://raw.githubusercontent.com/williangviana/crispr-geno/main/install/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/williangviana/crispr-geno/stable/install/install.sh | bash
 
 
 You will be asked where to install. Press Enter to accept the default
