@@ -156,8 +156,9 @@ def _iter_samples_rows(path: str):
 
 def load_samples_crispresso(path: str) -> tuple[str, list[Guide], list[Sample]]:
     """Load a CRISPResso-style batch sheet (TSV/CSV/XLSX) with columns:
-        name, fastq_r1, amplicon_seq, guide_seq
-    where guide_seq is comma-separated guide sequences.
+        name, fastq (or fastq_r1), amplicon_seq, guide_seq
+    where guide_seq is comma-separated guide sequences. `fastq` is the
+    standard column name; `fastq_r1` is accepted for CRISPResso compatibility.
 
     Returns (amplicon, guides, samples). Amplicon + guides are taken from the
     first data row (all rows are assumed to share the same amplicon/guides).
@@ -168,23 +169,28 @@ def load_samples_crispresso(path: str) -> tuple[str, list[Guide], list[Sample]]:
     amplicon: str | None = None
     guides: list[Guide] = []
     header_map: dict[str, int] = {}
+    fastq_col: str | None = None
 
     for i, parts in enumerate(_iter_samples_rows(path)):
         if not parts or not parts[0].strip():
             continue
         if i == 0:
             header_map = {h.strip().lower(): idx for idx, h in enumerate(parts)}
-            required = {"name", "fastq_r1", "amplicon_seq", "guide_seq"}
-            if not required.issubset(header_map):
+            base_required = {"name", "amplicon_seq", "guide_seq"}
+            if "fastq" in header_map:
+                fastq_col = "fastq"
+            elif "fastq_r1" in header_map:
+                fastq_col = "fastq_r1"
+            if not base_required.issubset(header_map) or fastq_col is None:
                 raise ValueError(
-                    f"{path}: expected CRISPResso columns "
-                    f"(name, fastq_r1, amplicon_seq, guide_seq); "
+                    f"{path}: expected columns "
+                    f"(name, fastq [or fastq_r1], amplicon_seq, guide_seq); "
                     f"got {parts}"
                 )
             continue
 
         name = parts[header_map["name"]].strip()
-        fq_rel = parts[header_map["fastq_r1"]].strip().strip('"\'')
+        fq_rel = parts[header_map[fastq_col]].strip().strip('"\'')
         amp_row = parts[header_map["amplicon_seq"]].strip().upper()
         guide_row = parts[header_map["guide_seq"]].strip().strip('"\'')
 
@@ -210,15 +216,17 @@ def load_samples_crispresso(path: str) -> tuple[str, list[Guide], list[Sample]]:
 
 
 def _has_crispresso_schema(path: str) -> bool:
-    """Peek at the first row of a file and check if it matches the CRISPResso
-    batch schema (name, fastq_r1, amplicon_seq, guide_seq in the header)."""
-    required = {"name", "fastq_r1", "amplicon_seq", "guide_seq"}
+    """Peek at the first row of a file and check if it matches the samples
+    schema (name, fastq [or fastq_r1], amplicon_seq, guide_seq in the header)."""
+    base_required = {"name", "amplicon_seq", "guide_seq"}
     try:
         for row in _iter_samples_rows(path):
             if not row:
                 continue
             header = {str(h).strip().lower() for h in row}
-            return required.issubset(header)
+            return base_required.issubset(header) and (
+                "fastq" in header or "fastq_r1" in header
+            )
     except Exception:
         return False
     return False
@@ -230,7 +238,7 @@ def find_crispresso_samples_file(directory: str, parents_to_check: int = 2) -> s
     directory:
        1. canonical filenames (samples.txt/.tsv/.csv/.xlsx)
        2. any .xlsx / .csv / .tsv / .txt whose header row matches the
-          CRISPResso schema (name, fastq_r1, amplicon_seq, guide_seq).
+          samples schema (name, fastq [or fastq_r1], amplicon_seq, guide_seq).
     """
     canonical = ("samples.txt", "samples.tsv", "samples.csv", "samples.xlsx")
     search_exts = (".xlsx", ".csv", ".tsv", ".txt")

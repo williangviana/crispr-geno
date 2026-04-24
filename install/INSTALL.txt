@@ -1,0 +1,23 @@
+crispr-geno — Installation
+==========================
+
+Requires macOS (Apple Silicon or Intel).
+The installer sets up Homebrew, Python 3.12, minimap2, samtools,
+and the crispr-geno command — all automatically.
+
+Open the Terminal and paste the command below:
+
+
+Mac
+---
+curl -fsSL https://raw.githubusercontent.com/williangviana/crispr-geno/main/install/install.sh | bash
+
+
+You will be asked where to install. Press Enter to accept the default
+($HOME/crispr-geno) or type a different path.
+
+After installation, open a new Terminal window and run:
+
+    crispr-geno --help
+
+Or double-click:  <install-folder>/crispr-geno.command

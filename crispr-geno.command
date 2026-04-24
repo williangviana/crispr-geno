@@ -40,7 +40,7 @@ cat <<'BANNER'
   How to use it
     • Put a samples sheet (samples.txt / .tsv / .csv / .xlsx)
       in the folder with your fastqs
-    • Columns: name, fastq_r1, amplicon_seq, guide_seq
+    • Columns: name, fastq (or fastq_r1), amplicon_seq, guide_seq
       (guide_seq is comma-separated)
     • Results go to <your-folder>/CRISPRgeno_results/
 

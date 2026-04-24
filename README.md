@@ -15,11 +15,31 @@ reads can be any length from ~200 bp up to full amplicon + overhangs.
 
 ## Install
 
+### One-line installer (macOS, recommended)
+
+Open Terminal and paste:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/williangviana/crispr-geno/main/install/install.sh | bash
+```
+
+You'll be prompted for an install location (default `~/crispr-geno`). The
+installer sets up Homebrew, Python 3.12, `minimap2`, `samtools`, creates a
+virtualenv, and puts the `crispr-geno` command on your PATH.
+
+Open a new Terminal window after install, then verify:
+
+```bash
+crispr-geno --help
+```
+
+### Alternative: conda
+
 Requires `minimap2` and `samtools` on PATH. The repo ships an `environment.yml`
 that sets up everything in a dedicated conda env:
 
 ```bash
-git clone <this-repo-or-copy-the-folder>
+git clone https://github.com/williangviana/crispr-geno.git
 cd crispr-geno
 
 # On Apple Silicon, prefix with CONDA_SUBDIR=osx-64 (some bioconda packages
@@ -33,12 +53,6 @@ The env name is `crispr-geno`. `pip install -e .` runs automatically as part
 of env creation, so the `crispr-geno` command is on PATH as soon as you
 activate.
 
-Verify:
-
-```bash
-crispr-geno --version
-```
-
 ## Usage
 
 ### Easiest: drop a `samples.txt` in your fastq folder
@@ -47,16 +61,17 @@ Create a tab-separated `samples.txt` in the folder that holds your fastqs, with
 these four columns:
 
 ```
-name	fastq_r1	amplicon_seq	guide_seq
+name	fastq	amplicon_seq	guide_seq
 plant-1	plant-1.fastq	CTGCATAGC...TGTGG	AAGCTATTCTCCCTCGGGGT,TCACACGAGCGTAACAAGGA
 plant-2	plant-2.fastq	CTGCATAGC...TGTGG	AAGCTATTCTCCCTCGGGGT,TCACACGAGCGTAACAAGGA
 ...
 ```
 
-Guide sequences are comma-separated. The amplicon and guides are taken from the
-first row (all samples must share the same amplicon and guides in a single run).
-This is the same format CRISPResso's batch mode uses, so if you already have
-one of those you can drop it in unchanged.
+The fastq column can be named either `fastq` (standard) or `fastq_r1`
+(CRISPResso batch-mode compatibility) — both are accepted. Guide sequences
+are comma-separated. The amplicon and guides are taken from the first row
+(all samples must share the same amplicon and guides in a single run). An
+existing CRISPResso batch sheet can be dropped in unchanged.
 
 Then either double-click `crispr-geno.command` and pick the folder, or run:
 
