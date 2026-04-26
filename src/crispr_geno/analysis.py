@@ -48,24 +48,64 @@ def rc(s: str) -> str:
     return s.translate(str.maketrans("ACGT", "TGCA"))[::-1]
 
 
-def find_cut(amp: str, guide: str) -> tuple[Optional[int], str]:
-    """Locate a guide's Cas9 cut site in the amplicon. Returns (cut_pos, strand)."""
-    if guide in amp:
-        return amp.find(guide) + 17, "+"
+def find_cut(amp: str, guide: str) -> tuple[Optional[int], str, bool]:
+    """Locate a guide's SpCas9 cut site in the amplicon.
+
+    Validates the NGG PAM on either side of the spacer match. The user may
+    supply the spacer in either convention (matching the genomic forward
+    strand or matching the reverse strand); whichever side carries a real
+    NGG PAM determines the cut orientation.
+
+    Returns (cut_pos, strand, pam_valid). When no NGG is found on either
+    side, falls back to the legacy canonical position so the tool still
+    runs, and pam_valid=False so the caller can warn.
+    """
+    candidates: list[tuple[int, str]] = []  # (cut_pos, strand) where PAM validates
+
+    p = amp.find(guide)
+    if p >= 0:
+        # Spacer-on-forward, PAM 3' on forward (NGG): canonical SpCas9 — cut 17 bp into spacer.
+        if amp[p + 20:p + 23][1:] == "GG":
+            candidates.append((p + 17, "+"))
+        # Spacer-on-forward, PAM 5' on forward (CCN = NGG on reverse): user supplied
+        # the spacer in reverse-complement convention; cut sits 3 bp into the match.
+        if p >= 3 and amp[p - 3:p][:2] == "CC":
+            candidates.append((p + 3, "-"))
+
     g_rc = rc(guide)
-    if g_rc in amp:
-        return amp.find(g_rc) + 3, "-"
-    return None, ""
+    p_rc = amp.find(g_rc)
+    if p_rc >= 0:
+        # Spacer-on-reverse (canonical for an rc-match), PAM 5' on forward (CCN).
+        if p_rc >= 3 and amp[p_rc - 3:p_rc][:2] == "CC":
+            candidates.append((p_rc + 3, "-"))
+        # Spacer-on-reverse with PAM 3' on forward — covers the rare flipped convention.
+        if amp[p_rc + 20:p_rc + 23][1:] == "GG":
+            candidates.append((p_rc + 17, "+"))
+
+    if candidates:
+        cut, strand = candidates[0]
+        return cut, strand, True
+
+    # Fallback when no NGG is found on either side: keep the legacy behavior so
+    # we still emit a cut position. The caller warns the user.
+    if p >= 0:
+        return p + 17, "+", False
+    if p_rc >= 0:
+        return p_rc + 3, "-", False
+    return None, "", False
 
 
 def resolve_guides(amp: str, guides: list[Guide]) -> list[Guide]:
     """Return a new list with cut_pos and strand filled. Skip ones not found."""
     resolved = []
     for g in guides:
-        cut, strand = find_cut(amp, g.sequence.upper())
+        cut, strand, pam_ok = find_cut(amp, g.sequence.upper())
         if cut is None:
             print(f"  WARN: guide {g.name} ({g.sequence}) not found in amplicon, skipping")
             continue
+        if not pam_ok:
+            print(f"  WARN: guide {g.name} ({g.sequence}) has no NGG PAM on either "
+                  f"side; cut position is a guess and may be wrong")
         resolved.append(Guide(g.name, g.sequence.upper(), cut, strand))
     return resolved
 
