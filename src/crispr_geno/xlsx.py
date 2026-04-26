@@ -137,7 +137,7 @@ def sequence_xlsx(
             PatternFill("solid", start_color="F4CCCC")),
         ("WT",       "wildtype — no edit detected at this site",
             PatternFill("solid", start_color="E7E6E6")),
-        ("lowN",     "fewer than 20 reads spanning the cut — cannot call",
+        ("lowN",     "fewer than 10 reads spanning the cut — cannot call",
             PatternFill("solid", start_color="F4CCCC")),
         ("+XYZ",     "homozygous insertion of XYZ at cut site",
             PatternFill("solid", start_color="C6E0B4")),

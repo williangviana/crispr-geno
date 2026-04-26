@@ -68,7 +68,7 @@ crispr-geno --input-dir /path/to/fastq_folder -o results/
 | Flag | Default | Purpose |
 |---|---:|---|
 | `--window` | 5 | bp each side of the cut where indels count |
-| `--min-spanning` | 20 | min reads spanning the cut to make a call |
+| `--min-spanning` | 10 | min reads spanning the cut to make a call |
 | `--homo-threshold` | 70 | % required for a homozygous call |
 | `--het-threshold` | 20 | % required for a het call |
 | `--min-read-len` | 200 | drop reads shorter than this |

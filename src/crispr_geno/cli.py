@@ -486,7 +486,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     # Thresholds / parameters
     p.add_argument("--window", type=int, default=5,
                    help="bp window on each side of the cut site.")
-    p.add_argument("--min-spanning", type=int, default=20,
+    p.add_argument("--min-spanning", type=int, default=10,
                    help="Minimum spanning reads required to call a genotype.")
     p.add_argument("--homo-threshold", type=float, default=70.0,
                    help="Percent threshold for a homozygous call.")
