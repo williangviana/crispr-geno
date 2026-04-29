@@ -19,6 +19,7 @@ from .analysis import (
     find_large_deletions,
     resolve_guides,
 )
+from .phasing import per_guide_cells, phase_sample
 from .xlsx import sequence_xlsx
 
 
@@ -274,7 +275,11 @@ def find_crispresso_samples_file(directory: str, parents_to_check: int = 2) -> s
 def run_analysis(amplicon: str, guides: list[Guide], samples: list[Sample],
                  out_dir: str, window: int, min_spanning: int,
                  homo_threshold: float, het_threshold: float,
-                 min_read_len: int, threads: int) -> None:
+                 min_read_len: int, threads: int,
+                 phasing_noise_frac: float = 0.05,
+                 phasing_noise_min_reads: int = 2,
+                 mosaic_threshold_frac: float = 0.15,
+                 legacy_output: bool = False) -> None:
     check_tools()
     os.makedirs(out_dir, exist_ok=True)
     bam_dir = os.path.join(out_dir, "bam")
@@ -312,6 +317,10 @@ def run_analysis(amplicon: str, guides: list[Guide], samples: list[Sample],
     # Cache SV detection results per plant so we can emit rows/columns later.
     sv_results_per_plant: list[tuple[str, dict]] = []  # (plant_id, results_dict)
     sv_rates_rows: list[list[str]] = []
+    # Phasing pass: per-sample primary-sheet rows + audit haplotypes.csv rows.
+    phased_rows: list[list[str]] = []
+    phased_conf_rows: list[list[str]] = []
+    haplo_rows: list[list[str]] = []
 
     for s in samples:
         if not os.path.exists(s.fastq):
@@ -389,6 +398,40 @@ def run_analysis(amplicon: str, guides: list[Guide], samples: list[Sample],
         conf_rows.append(["ambiguous" if plant_status == "Cas9+" else ""] +
                          [ac.confidence for ac in plant_calls])
 
+        # Read-level haplotype phasing: one consolidated per-chromosome call
+        # per sample, plus the per-guide A1/A2 cells.
+        phasing = phase_sample(
+            s.id, bam, ref_name, ref_seq, guides, sv_results,
+            window=window, min_spanning=min_spanning,
+            min_read_len=min_read_len,
+            noise_frac=phasing_noise_frac,
+            noise_min_reads=phasing_noise_min_reads,
+            het_threshold_frac=het_threshold / 100.0,
+            mosaic_threshold_frac=mosaic_threshold_frac,
+        )
+        a1 = phasing.haplotypes[0].description if phasing.haplotypes else ""
+        a2 = (phasing.haplotypes[1].description if len(phasing.haplotypes) >= 2
+              else (phasing.haplotypes[0].description if phasing.haplotypes else ""))
+        per_guide = per_guide_cells(phasing, guides, ref_seq)
+        phased_rows.append(
+            [s.id, plant_status, phasing.zygosity_call, a1, a2]
+            + per_guide
+            + [str(phasing.n_phased), ", ".join(phasing.notes)]
+        )
+        ambig_flag = "ambiguous" if phasing.is_mosaic else ""
+        phased_conf_rows.append(
+            ["", "", ambig_flag, "", ""] + [""] * len(per_guide) + ["", ""]
+        )
+        for tup, n in phasing.all_tuples:
+            haplo_rows.append([
+                s.id,
+                "/".join(tup),
+                str(n),
+                f"{(n / phasing.n_phased * 100.0) if phasing.n_phased else 0:.2f}",
+            ])
+        print(f"  {s.id} phased: {phasing.zygosity_call} | "
+              f"A1={a1 or '-'} | A2={a2 or '-'} | n={phasing.n_phased}")
+
     # Figure out which (i,j) guide pairs had any SV detected across the dataset.
     # Only those pairs get columns. Pairs with zero detections in any plant are
     # omitted to keep the table narrow.
@@ -448,12 +491,44 @@ def run_analysis(amplicon: str, guides: list[Guide], samples: list[Sample],
             for row in sv_rates_rows:
                 w.writerow([_csv_safe(c) for c in row])
 
+    # Audit CSV: every post-merge haplotype tuple per sample.
+    haplo_csv = os.path.join(out_dir, "haplotypes.csv")
+    with open(haplo_csv, "w", newline="") as f:
+        w = _csv.writer(f)
+        w.writerow(["sample", "haplotype_tuple", "support_reads", "support_pct"])
+        for row in haplo_rows:
+            w.writerow([_csv_safe(c) for c in row])
+
+    # Build the primary-sheet header for the phased view.
+    phased_header = (
+        ["Plant ID", "Status", "Zygosity call", "Allele 1", "Allele 2"]
+        + [g.name for g in guides]
+        + ["Phased reads", "Notes"]
+    )
+
     print("\nWriting xlsx...")
     seq_xlsx_path = os.path.join(out_dir, "results.xlsx")
-    sequence_xlsx(table_header, seq_rows, seq_xlsx_path, conf_rows=conf_rows)
+    if legacy_output:
+        # Legacy primary, phased hidden.
+        sequence_xlsx(
+            table_header, seq_rows, seq_xlsx_path, conf_rows=conf_rows,
+            secondary_header=phased_header, secondary_rows=phased_rows,
+            secondary_conf_rows=phased_conf_rows,
+            secondary_title="Phased",
+            primary_is_phased=False,
+        )
+    else:
+        # New default: phased primary, legacy per-guide raw hidden.
+        sequence_xlsx(
+            phased_header, phased_rows, seq_xlsx_path, conf_rows=phased_conf_rows,
+            secondary_header=table_header, secondary_rows=seq_rows,
+            secondary_conf_rows=conf_rows,
+            secondary_title="Per-guide raw",
+            primary_is_phased=True,
+        )
 
     print(f"\nDone.  Outputs in {out_dir}/:")
-    for name in ("editing_rates.csv", "results.xlsx"):
+    for name in ("editing_rates.csv", "results.xlsx", "haplotypes.csv"):
         print(f"  {name}")
     if sv_rates_rows:
         print("  sv_events.csv")
@@ -496,6 +571,21 @@ def main(argv: Optional[list[str]] = None) -> None:
                    help="Minimum read length (bp) to include.")
     p.add_argument("--threads", type=int, default=4,
                    help="Threads for minimap2 / samtools.")
+
+    # Phasing parameters
+    p.add_argument("--phasing-noise-frac", type=float, default=0.05,
+                   help="Haplotype-tuple support fraction below which a tuple "
+                        "is merged into the nearest dominant tuple as noise.")
+    p.add_argument("--phasing-noise-min-reads", type=int, default=2,
+                   help="Minimum read support for a tuple to be considered "
+                        "non-noise (used in conjunction with --phasing-noise-frac).")
+    p.add_argument("--mosaic-threshold", type=float, default=0.15,
+                   help="If >=3 distinct haplotype tuples each cross this "
+                        "fraction, the sample is flagged as mosaic.")
+    p.add_argument("--legacy-output", action="store_true",
+                   help="Make the legacy per-guide table the primary xlsx sheet "
+                        "and the phased view secondary (for downstream tools "
+                        "that rely on the old column layout).")
 
     args = p.parse_args(argv)
 
@@ -582,6 +672,10 @@ def main(argv: Optional[list[str]] = None) -> None:
         het_threshold=args.het_threshold,
         min_read_len=args.min_read_len,
         threads=args.threads,
+        phasing_noise_frac=args.phasing_noise_frac,
+        phasing_noise_min_reads=args.phasing_noise_min_reads,
+        mosaic_threshold_frac=args.mosaic_threshold,
+        legacy_output=args.legacy_output,
     )
 
 

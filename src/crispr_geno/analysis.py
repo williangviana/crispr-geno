@@ -176,7 +176,7 @@ def count_indels(bam_path: str, ref_name: str, cut_pos: int,
     return GuideCounts(spanning, ins1, del1, ins_ge2, del_ge2)
 
 
-def _read_signature(read, cut_pos: int, window: int):
+def read_signature(read, cut_pos: int, window: int):
     """Tuple of (('I'|'D', size, ref_pos), ...) near the cut and inserted seqs dict."""
     pos = read.reference_start
     qpos = 0
@@ -205,6 +205,10 @@ def _read_signature(read, cut_pos: int, window: int):
         elif op == 3:
             pos += length
     return tuple(events), ins_seqs
+
+
+# Back-compat alias: the private name is still used internally by call_allele.
+_read_signature = read_signature
 
 
 def call_allele(bam_path: str, ref_name: str, ref_seq: str, cut_pos: int,
@@ -349,6 +353,8 @@ def find_large_deletions(
 
     # supporting reads per pair: key = (i, j), value = list of deletion sizes
     sv_sizes: dict[tuple[int, int], list[int]] = {}
+    # query_names of reads supporting each pair's SV (for downstream phasing)
+    sv_read_names: dict[tuple[int, int], set[str]] = {}
     # spanning reads per pair: reads whose alignment covers both cut sites
     # (needed to compute the correct denominator)
     span_reads: dict[tuple[int, int], int] = {}
@@ -388,6 +394,7 @@ def find_large_deletions(
                         if (abs(del_start - lo_c) <= breakpoint_window and
                                 abs(del_end - hi_c) <= breakpoint_window):
                             sv_sizes.setdefault((i, j), []).append(length)
+                            sv_read_names.setdefault((i, j), set()).add(read.query_name)
                 pos += length
             elif op == 1:
                 pass  # I doesn't consume ref
@@ -420,6 +427,7 @@ def find_large_deletions(
             "median_size": median,
             "call": call,
             "top_frac": frac,
+            "supporting_read_names": sv_read_names.get(pair, set()),
         }
     return results
 
