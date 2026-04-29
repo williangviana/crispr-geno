@@ -75,7 +75,7 @@ crispr-geno --input-dir /path/to/fastq_folder -o results/
 | `--threads` | 4 | threads for minimap2 / samtools |
 | `--phasing-noise-frac` | 0.05 | merge haplotype tuples below this fraction into the nearest dominant tuple |
 | `--phasing-noise-min-reads` | 2 | minimum reads for a tuple to escape noise merging |
-| `--mosaic-threshold` | 0.15 | flag sample as mosaic when ≥3 haplotype tuples each cross this fraction |
+| `--mosaic-threshold` | 0.10 | flag sample as mosaic when ≥3 haplotype tuples each cross this fraction |
 | `--legacy-output` | (off) | make the legacy per-guide table the primary xlsx sheet (compat for old downstream consumers) |
 
 ## Outputs

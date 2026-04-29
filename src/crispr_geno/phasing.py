@@ -192,7 +192,7 @@ def merge_noise_tuples(
 def pick_haplotypes(
     merged: collections.Counter,
     het_threshold_frac: float = 0.20,
-    mosaic_threshold_frac: float = 0.15,
+    mosaic_threshold_frac: float = 0.10,
 ) -> tuple[list[HaplotypeTuple], bool]:
     """Pick the top 1-2 haplotypes from the merged Counter.
 
@@ -349,7 +349,7 @@ def phase_sample(
     noise_frac: float = 0.05,
     noise_min_reads: int = 2,
     het_threshold_frac: float = 0.20,
-    mosaic_threshold_frac: float = 0.15,
+    mosaic_threshold_frac: float = 0.10,
 ) -> PhasingResult:
     """Run the full phasing pass for one sample."""
     counter, details_store, n_partial = build_read_haplotypes(

@@ -278,7 +278,7 @@ def run_analysis(amplicon: str, guides: list[Guide], samples: list[Sample],
                  min_read_len: int, threads: int,
                  phasing_noise_frac: float = 0.05,
                  phasing_noise_min_reads: int = 2,
-                 mosaic_threshold_frac: float = 0.15,
+                 mosaic_threshold_frac: float = 0.10,
                  legacy_output: bool = False) -> None:
     check_tools()
     os.makedirs(out_dir, exist_ok=True)
@@ -593,7 +593,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     p.add_argument("--phasing-noise-min-reads", type=int, default=2,
                    help="Minimum read support for a tuple to be considered "
                         "non-noise (used in conjunction with --phasing-noise-frac).")
-    p.add_argument("--mosaic-threshold", type=float, default=0.15,
+    p.add_argument("--mosaic-threshold", type=float, default=0.10,
                    help="If >=3 distinct haplotype tuples each cross this "
                         "fraction, the sample is flagged as mosaic.")
     p.add_argument("--legacy-output", action="store_true",
