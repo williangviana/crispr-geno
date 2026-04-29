@@ -377,6 +377,13 @@ def phase_sample(
     top_tuples, is_mosaic = pick_haplotypes(
         merged, het_threshold_frac, mosaic_threshold_frac,
     )
+    # If the noise-merge step absorbed a large fraction of phased reads,
+    # the pre-merge counter held many distinct minor tuples (each below
+    # 5%) — i.e. real haplotype diversity, not basecalling drift. The
+    # post-merge tuple-counting can't see that anymore, so flag mosaic
+    # directly off the merged-ratio.
+    if n_phased and n_merged_in / n_phased > 0.30:
+        is_mosaic = True
     if is_mosaic:
         notes.append("mosaic")
 
