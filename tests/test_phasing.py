@@ -310,6 +310,43 @@ def test_phasing_mismatch_skips_lowN_per_guide():
     assert detect_phasing_mismatch(plant_calls, result, guides) == []
 
 
+def test_phasing_mismatch_flags_unnamed_edit_when_call_is_WT_but_top_frac_high():
+    # WV301-3-style case: per-guide call is 'WT' (signal didn't reach
+    # the caller's own threshold for naming an allele), but top_frac is
+    # 17% — above the cross-check threshold. Phased view is SV-only at
+    # this slot, so we should still flag it (with a generic 'edit' note).
+    guides = [_g("gRNA1", 100), _g("gRNA2", 200)]
+    result = _make_sv_phasing_result(n_guides=2)
+    plant_calls = [
+        AlleleCall("WT", 200, 5.0,  3.0,  90.0, "high"),
+        AlleleCall("WT", 190, 17.0, 10.0, 2.6,  "ambiguous"),
+    ]
+    notes = detect_phasing_mismatch(plant_calls, result, guides)
+    assert notes == ["phasing-mismatch:gRNA2:edit@17%"]
+
+
+def test_phasing_mismatch_silent_when_phased_already_has_a_real_edit_at_slot():
+    # If the phased view already has a non-WT non-SV slot at this guide,
+    # an unnamed per-guide signal is presumed to be that same edit and
+    # we don't re-flag it.
+    guides = [_g("gRNA1", 100), _g("gRNA2", 200)]
+    h = Haplotype(
+        rank=1, tuple_=("WT", "+1"),
+        details=[SlotDetail("WT"), SlotDetail("+1", 1, "T", 200)],
+        support_reads=200, support_frac=1.0, description="gRNA2:+T",
+    )
+    result = PhasingResult(
+        sample="x", n_phased=200, n_partial=0,
+        haplotypes=[h], zygosity_call="homozygous", is_mosaic=False,
+        notes=[], all_tuples=[],
+    )
+    plant_calls = [
+        AlleleCall("WT", 200, 2.0,  1.0,  95.0, "high"),
+        AlleleCall("WT", 200, 17.0, 5.0,  70.0, "ambiguous"),
+    ]
+    assert detect_phasing_mismatch(plant_calls, result, guides) == []
+
+
 def test_phasing_mismatch_returns_empty_when_no_haplotypes():
     guides = [_g("gRNA1", 100)]
     result = PhasingResult(

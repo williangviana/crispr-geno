@@ -480,11 +480,11 @@ def detect_phasing_mismatch(
         if ac.top_frac < threshold_pct:
             continue
         slots = {h.tuple_[i] for h in result.haplotypes}
+        # Try to attribute the mismatch to a specific allele from the call
+        found = False
         for part in ac.call.split("/"):
             part = part.strip()
-            if part in ("WT", "", "lowN"):
-                continue
-            if part.startswith("SV"):
+            if part in ("WT", "", "lowN") or part.startswith("SV"):
                 continue
             phased_eq = _per_guide_label_to_phased(part)
             if phased_eq is None or phased_eq in slots:
@@ -492,5 +492,17 @@ def detect_phasing_mismatch(
             notes.append(
                 f"phasing-mismatch:{guides[i].name}:{part}@{ac.top_frac:.0f}%"
             )
-            break  # one note per guide
+            found = True
+            break
+        if found:
+            continue
+        # No specific allele extractable from the call (e.g. call='WT' but
+        # top_frac is still ≥ threshold — the per-guide caller saw edit
+        # signal but no allele crossed its own threshold for naming). If
+        # the phased view has nothing but WT/SV at this slot, that's still
+        # a mismatch worth flagging.
+        if all(s in ("WT", "SV") for s in slots):
+            notes.append(
+                f"phasing-mismatch:{guides[i].name}:edit@{ac.top_frac:.0f}%"
+            )
     return notes
