@@ -347,6 +347,56 @@ def test_phasing_mismatch_silent_when_phased_already_has_a_real_edit_at_slot():
     assert detect_phasing_mismatch(plant_calls, result, guides) == []
 
 
+def test_phasing_mismatch_silent_when_per_guide_large_deletion_is_the_SV():
+    # ME034v-pWGV242-4-5-style: SV is a 102 bp deletion spanning gRNA1
+    # and gRNA2. Phased view shows 'SV' at those slots; the per-guide
+    # caller (which doesn't know about SVs) reports the same 102 bp
+    # deletion as a long indel ('-AATATGCTGAT...AT'). Same lesion —
+    # don't flag it as a mismatch.
+    guides = [_g("gRNA1", 100), _g("gRNA2", 200), _g("gRNA3", 300)]
+    h = Haplotype(
+        rank=1, tuple_=("SV", "SV", "-1"),
+        details=[SlotDetail("SV"), SlotDetail("SV"), SlotDetail("-1", 1, "", 300)],
+        support_reads=49, support_frac=1.0, description="SV:-102bp",
+    )
+    result = PhasingResult(
+        sample="x", n_phased=49, n_partial=329,
+        haplotypes=[h], zygosity_call="homozygous", is_mosaic=False,
+        notes=[], all_tuples=[],
+    )
+    long_del = "-" + "A" * 102  # 102 bp deletion = the SV size
+    plant_calls = [
+        AlleleCall(long_del, 99, 99.0, 1.0, 0.0, "med"),
+        AlleleCall(long_del, 99, 99.0, 1.0, 0.0, "med"),
+        AlleleCall("-G",     228, 96.9, 0.9, 0.9, "high"),
+    ]
+    assert detect_phasing_mismatch(plant_calls, result, guides) == []
+
+
+def test_phasing_mismatch_still_flags_small_deletion_when_phased_has_SV():
+    # Same SV setup, but the per-guide caller sees a small deletion
+    # (10 bp, below the SV threshold) at a guide that the phased view
+    # marks as SV — that's a different lesion from a real second
+    # chromosome, still a mismatch.
+    guides = [_g("gRNA1", 100), _g("gRNA2", 200)]
+    h = Haplotype(
+        rank=1, tuple_=("SV", "SV"),
+        details=[SlotDetail("SV"), SlotDetail("SV")],
+        support_reads=200, support_frac=1.0, description="SV:-5kbp",
+    )
+    result = PhasingResult(
+        sample="x", n_phased=200, n_partial=0,
+        haplotypes=[h], zygosity_call="homozygous", is_mosaic=False,
+        notes=[], all_tuples=[],
+    )
+    plant_calls = [
+        AlleleCall("WT",          200, 1.0,  0.5, 98.0, "high"),
+        AlleleCall("-AAAAAAAAAA", 200, 25.0, 5.0, 70.0, "ambiguous"),  # 10 bp
+    ]
+    notes = detect_phasing_mismatch(plant_calls, result, guides)
+    assert notes == ["phasing-mismatch:gRNA2:-AAAAAAAAAA@25%"]
+
+
 def test_phasing_mismatch_returns_empty_when_no_haplotypes():
     guides = [_g("gRNA1", 100)]
     result = PhasingResult(

@@ -496,6 +496,17 @@ def detect_phasing_mismatch(
             phased_eq = _per_guide_label_to_phased(part)
             if phased_eq is None or phased_eq in slots:
                 continue
+            # Same-lesion guard: a guide inside an SV span shows 'SV' in
+            # the phased view, but the per-guide caller (which doesn't
+            # know about SV) sees the same deletion as a long indel.
+            # Skip when phased has SV here and the per-guide indel is
+            # large enough to be the SV itself.
+            if "SV" in slots and phased_eq.startswith("-"):
+                try:
+                    if int(phased_eq[1:]) >= 50:
+                        continue
+                except ValueError:
+                    pass
             notes.append(
                 f"phasing-mismatch:{guides[i].name}:{part}@{ac.top_frac:.0f}%"
             )
@@ -503,11 +514,18 @@ def detect_phasing_mismatch(
             break
         if found:
             continue
-        # No specific allele extractable from the call (e.g. call='WT' but
-        # top_frac is still ≥ threshold — the per-guide caller saw edit
-        # signal but no allele crossed its own threshold for naming). If
-        # the phased view has nothing but WT/SV at this slot, that's still
-        # a mismatch worth flagging.
+        # Generic fallback only when the call truly has no specific
+        # non-WT non-SV allele to attribute the signal to. If the call
+        # named an allele but the loop above skipped it (e.g. it matched
+        # a phased slot, or it was the SV showing through as a long
+        # indel), the signal is already explained — don't emit a
+        # spurious generic 'edit' note on top.
+        has_named_allele = any(
+            p.strip() not in ("WT", "", "lowN") and not p.strip().startswith("SV")
+            for p in ac.call.split("/")
+        )
+        if has_named_allele:
+            continue
         if all(s in ("WT", "SV") for s in slots):
             notes.append(
                 f"phasing-mismatch:{guides[i].name}:edit@{ac.top_frac:.0f}%"
