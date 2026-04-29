@@ -19,7 +19,7 @@ from .analysis import (
     find_large_deletions,
     resolve_guides,
 )
-from .phasing import per_guide_cells, phase_sample
+from .phasing import detect_phasing_mismatch, per_guide_cells, phase_sample
 from .xlsx import sequence_xlsx
 
 
@@ -413,12 +413,26 @@ def run_analysis(amplicon: str, guides: list[Guide], samples: list[Sample],
         a2 = (phasing.haplotypes[1].description if len(phasing.haplotypes) >= 2
               else (phasing.haplotypes[0].description if phasing.haplotypes else ""))
         per_guide = per_guide_cells(phasing, guides, ref_seq)
+
+        # Cross-check: per-guide caller may have seen edits the phased
+        # view missed (typically when an SV chromosome dominates the
+        # phasable reads and the other chromosome's edits are stranded
+        # in partial-coverage). Promote the call if so.
+        mismatch_notes = detect_phasing_mismatch(plant_calls, phasing, guides)
+        zygosity_call = phasing.zygosity_call
+        if mismatch_notes:
+            if zygosity_call == "homozygous":
+                zygosity_call = "biallelic"
+            elif zygosity_call == "WT":
+                zygosity_call = "heterozygous"
+        all_notes = phasing.notes + mismatch_notes
+
         phased_rows.append(
-            [s.id, plant_status, phasing.zygosity_call, a1, a2]
+            [s.id, plant_status, zygosity_call, a1, a2]
             + per_guide
-            + [str(phasing.n_phased), ", ".join(phasing.notes)]
+            + [str(phasing.n_phased), ", ".join(all_notes)]
         )
-        ambig_flag = "ambiguous" if phasing.is_mosaic else ""
+        ambig_flag = "ambiguous" if (phasing.is_mosaic or mismatch_notes) else ""
         phased_conf_rows.append(
             ["", "", ambig_flag, "", ""] + [""] * len(per_guide) + ["", ""]
         )
@@ -429,7 +443,7 @@ def run_analysis(amplicon: str, guides: list[Guide], samples: list[Sample],
                 str(n),
                 f"{(n / phasing.n_phased * 100.0) if phasing.n_phased else 0:.2f}",
             ])
-        print(f"  {s.id} phased: {phasing.zygosity_call} | "
+        print(f"  {s.id} phased: {zygosity_call} | "
               f"A1={a1 or '-'} | A2={a2 or '-'} | n={phasing.n_phased}")
 
     # Figure out which (i,j) guide pairs had any SV detected across the dataset.

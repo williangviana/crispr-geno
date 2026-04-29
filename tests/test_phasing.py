@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import collections
 
-from crispr_geno.analysis import Guide
+from crispr_geno.analysis import AlleleCall, Guide
 from crispr_geno.phasing import (
     SlotDetail,
     _slot_description,
     _zygosity_call,
+    detect_phasing_mismatch,
     merge_noise_tuples,
     per_guide_cells,
     PhasingResult,
@@ -234,3 +235,87 @@ def test_per_guide_cells_renders_a1_slash_a2():
     )
     cells = per_guide_cells(result, guides, "X" * 500)
     assert cells == ["SV / WT", "SV / +T", "SV / WT", "SV / WT"]
+
+
+# ---- detect_phasing_mismatch -------------------------------------------
+
+def _make_sv_phasing_result(n_guides: int = 4) -> PhasingResult:
+    """Build a phasing result with a single dominant SV/SV/.../SV haplotype.
+    Mirrors the WV301-1-style case where partial-coverage stranded the
+    second chromosome's reads and the phased view collapsed to one SV
+    haplotype."""
+    tup = tuple(["SV"] * n_guides)
+    h = Haplotype(
+        rank=1, tuple_=tup, details=[SlotDetail("SV")] * n_guides,
+        support_reads=150, support_frac=1.0, description="SV:-5412bp",
+    )
+    return PhasingResult(
+        sample="WV301-1", n_phased=150, n_partial=2800,
+        haplotypes=[h], zygosity_call="homozygous", is_mosaic=False,
+        notes=["partial-coverage:2800"], all_tuples=[],
+    )
+
+
+def test_phasing_mismatch_flags_per_guide_edit_missing_from_phased():
+    # Real-world WV301-1 case: per-guide caller flagged 'ambiguous'
+    # because of competing +T and SV-deletion at gRNA2; phased view only
+    # sees SV. Mismatch detection should fire on the +T.
+    guides = [_g("gRNA1", 100), _g("gRNA2", 200), _g("gRNA3", 300), _g("gRNA4", 400)]
+    result = _make_sv_phasing_result(n_guides=4)
+    plant_calls = [
+        AlleleCall("WT",     500, 2.0,  1.0, 95.0, "high"),
+        AlleleCall("+T/WT",  424, 41.0, 5.0, 9.0,  "ambiguous"),
+        AlleleCall("WT",     500, 3.0,  1.0, 90.0, "high"),
+        AlleleCall("WT",     500, 1.0,  0.0, 95.0, "high"),
+    ]
+    notes = detect_phasing_mismatch(plant_calls, result, guides)
+    assert notes == ["phasing-mismatch:gRNA2:+T@41%"]
+
+
+def test_phasing_mismatch_silent_when_phased_already_has_the_edit():
+    guides = [_g("gRNA1", 100), _g("gRNA2", 200)]
+    h = Haplotype(
+        rank=1, tuple_=("WT", "+1"), details=[SlotDetail("WT"), SlotDetail("+1", 1, "T", 200)],
+        support_reads=200, support_frac=1.0, description="gRNA2:+T",
+    )
+    result = PhasingResult(
+        sample="x", n_phased=200, n_partial=0,
+        haplotypes=[h], zygosity_call="homozygous", is_mosaic=False,
+        notes=[], all_tuples=[],
+    )
+    plant_calls = [
+        AlleleCall("WT",   200, 2.0,  1.0, 95.0, "high"),
+        AlleleCall("+T",   200, 95.0, 1.0, 4.0,  "high"),  # already in phased
+    ]
+    assert detect_phasing_mismatch(plant_calls, result, guides) == []
+
+
+def test_phasing_mismatch_skips_low_fraction_signals():
+    guides = [_g("gRNA1", 100), _g("gRNA2", 200)]
+    result = _make_sv_phasing_result(n_guides=2)
+    plant_calls = [
+        AlleleCall("WT",    500, 2.0,  1.0, 95.0, "high"),
+        AlleleCall("+T/WT", 500, 8.0,  2.0, 88.0, "low"),  # below 15% threshold
+    ]
+    assert detect_phasing_mismatch(plant_calls, result, guides) == []
+
+
+def test_phasing_mismatch_skips_lowN_per_guide():
+    guides = [_g("gRNA1", 100), _g("gRNA2", 200)]
+    result = _make_sv_phasing_result(n_guides=2)
+    plant_calls = [
+        AlleleCall("WT",   500, 1.0,  0.0, 98.0, "high"),
+        AlleleCall("lowN", 5,   0.0,  0.0, 0.0,  "lowN"),
+    ]
+    assert detect_phasing_mismatch(plant_calls, result, guides) == []
+
+
+def test_phasing_mismatch_returns_empty_when_no_haplotypes():
+    guides = [_g("gRNA1", 100)]
+    result = PhasingResult(
+        sample="x", n_phased=0, n_partial=0,
+        haplotypes=[], zygosity_call="lowN", is_mosaic=False,
+        notes=[], all_tuples=[],
+    )
+    plant_calls = [AlleleCall("+T", 200, 90.0, 0.0, 5.0, "high")]
+    assert detect_phasing_mismatch(plant_calls, result, guides) == []

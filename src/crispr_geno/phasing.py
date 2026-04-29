@@ -11,12 +11,13 @@ the substrate for the consolidated zygosity column in results.xlsx.
 from __future__ import annotations
 
 import collections
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
 import pysam
 
-from .analysis import Guide, read_signature
+from .analysis import AlleleCall, Guide, read_signature
 
 
 # ---- Types --------------------------------------------------------------
@@ -431,3 +432,65 @@ def per_guide_cells(result: PhasingResult, guides: list[Guide], ref_seq: str) ->
         b = _slot_short(h2.details[gi], ref_seq)
         cells.append(a if a == b else f"{a} / {b}")
     return cells
+
+
+# ---- Cross-check: per-guide caller vs phased haplotypes ----------------
+
+_INDEL_RE = re.compile(r"^([+-])([ACGT]+)$", re.IGNORECASE)
+
+
+def _per_guide_label_to_phased(label: str) -> str | None:
+    """Map a per-guide caller's allele label ('+T', '-CCC') to a phased
+    slot label ('+1', '-3'). Returns None for SV / WT / unparseable."""
+    m = _INDEL_RE.match(label)
+    if m:
+        sign, seq = m.groups()
+        return f"{sign}{len(seq)}"
+    return None
+
+
+def detect_phasing_mismatch(
+    plant_calls: list[AlleleCall],
+    result: PhasingResult,
+    guides: list[Guide],
+    threshold_pct: float = 15.0,
+) -> list[str]:
+    """Find guides where the per-guide caller saw a non-WT, non-SV allele
+    above threshold_pct that no phased haplotype represents.
+
+    The phasing pass needs every read to span every guide cut window. If
+    one chromosome carries a large SV, reads spanning the SV breakpoint
+    trivially cover all guides — but the *other* chromosome's reads may
+    need to span the full amplicon and often get dropped as partial-
+    coverage. The per-guide caller doesn't have that constraint, so it
+    can see edits the phased view missed. This helper surfaces that gap
+    so the call doesn't silently collapse to a single-haplotype answer.
+
+    Returns one note per affected guide, e.g.
+    'phasing-mismatch:gRNA2:+T@41%'.
+    """
+    if not result.haplotypes:
+        return []
+    n = len(result.haplotypes[0].tuple_)
+    notes: list[str] = []
+    for i in range(min(n, len(plant_calls), len(guides))):
+        ac = plant_calls[i]
+        if ac.confidence == "lowN":
+            continue
+        if ac.top_frac < threshold_pct:
+            continue
+        slots = {h.tuple_[i] for h in result.haplotypes}
+        for part in ac.call.split("/"):
+            part = part.strip()
+            if part in ("WT", "", "lowN"):
+                continue
+            if part.startswith("SV"):
+                continue
+            phased_eq = _per_guide_label_to_phased(part)
+            if phased_eq is None or phased_eq in slots:
+                continue
+            notes.append(
+                f"phasing-mismatch:{guides[i].name}:{part}@{ac.top_frac:.0f}%"
+            )
+            break  # one note per guide
+    return notes
