@@ -223,6 +223,12 @@ def _write_sheet(ws, header, rows, conf_rows, legend_entries):
         for ci, c in enumerate(row[1:]):
             c.font = _MONO; c.alignment = _LFT
             c.border = _BD_AMBIG if (conf and ci < len(conf) and conf[ci] == "ambiguous") else _BD
+            # Allele 1 / Allele 2 are free-text per-chromosome descriptions —
+            # leave uncolored. Coloring there was misleading (descriptive
+            # text shouldn't read as a categorical fill).
+            header_val = ws.cell(1, ci + 2).value
+            if header_val in ("Allele 1", "Allele 2"):
+                continue
             fill = _pick_seq_fill(c.value or "")
             if fill is not None:
                 c.fill = fill
