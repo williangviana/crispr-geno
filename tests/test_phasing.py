@@ -8,7 +8,14 @@ from __future__ import annotations
 
 import collections
 
-from crispr_geno.analysis import AlleleCall, Guide
+from crispr_geno.analysis import (
+    AlleleCall,
+    Guide,
+    _left_normalize_deletion,
+    _left_normalize_insertion,
+    detect_per_guide_mosaic,
+    per_guide_noise_floors,
+)
 from crispr_geno.phasing import (
     SlotDetail,
     _slot_description,
@@ -16,11 +23,57 @@ from crispr_geno.phasing import (
     detect_phasing_mismatch,
     merge_noise_tuples,
     per_guide_cells,
+    per_guide_imputation,
     PhasingResult,
     Haplotype,
     pick_haplotypes,
     render_haplotype_description,
+    residual_non_wt_phased,
 )
+
+
+# ---- indel left-normalization -------------------------------------------
+
+def test_left_normalize_deletion_in_homopolymer():
+    # Reference: "AAATTTTCGT". Deleting any single T at positions 3, 4,
+    # 5, or 6 produces the same biological outcome — should all
+    # normalize to position 3 (the leftmost T).
+    ref = "AAATTTTCGT"
+    for pos in (3, 4, 5, 6):
+        assert _left_normalize_deletion(pos, 1, ref) == 3
+
+
+def test_left_normalize_deletion_unique_position_unchanged():
+    # Non-repetitive context: nothing to shift.
+    ref = "AAACGTACGT"
+    assert _left_normalize_deletion(4, 2, ref) == 4   # del 'GT'
+
+
+def test_left_normalize_insertion_in_homopolymer():
+    # Reference: "AAATTTTCGT". Inserting +T at positions 3-7 inside the
+    # TTTT run all normalize to position 3 with seq "T".
+    ref = "AAATTTTCGT"
+    for pos in (3, 4, 5, 6, 7):
+        norm_pos, norm_seq = _left_normalize_insertion(pos, "T", ref)
+        assert norm_pos == 3
+        assert norm_seq == "T"
+
+
+def test_left_normalize_insertion_rotates_multibase_seq():
+    # Inserting "TC" at the end of a TTTT homopolymer — rotates as it
+    # shifts left. After full rotation the result is unchanged at the
+    # start of TTTT, since inserting "TC" before the run vs. after is
+    # only equivalent for cyclic-rotation-friendly seqs.
+    ref = "AAATTTTCGT"
+    norm_pos, norm_seq = _left_normalize_insertion(7, "TC", ref)
+    # 'TC' inserted at pos 7: ref[6]='T'==seq[-1]='C'? No → no shift.
+    assert (norm_pos, norm_seq) == (7, "TC")
+
+
+def test_left_normalize_insertion_no_seq_returns_unchanged():
+    # Empty inserted sequence → no rotation possible.
+    ref = "AAATTTTCGT"
+    assert _left_normalize_insertion(5, "", ref) == (5, "")
 
 
 # ---- merge_noise_tuples -------------------------------------------------
@@ -75,6 +128,52 @@ def test_pick_haplotypes_flags_mosaic_when_three_clusters_pass_threshold():
     assert mosaic is True
     # Top-2 still returned even when mosaic.
     assert len(top) == 2
+
+
+def test_pick_haplotypes_flags_mosaic_when_wt_dominant_but_non_wt_fragmented():
+    # WV151-2-4-7 pattern: WT at ~52%, plus 6 distinct edited haplotypes
+    # each at 5-12%. No single edited tuple clears het threshold, but the
+    # non-WT mass is ~48% spread across many lesions — mosaic on the
+    # second chromosome, not a clean het.
+    merged = collections.Counter({
+        ("WT", "WT", "WT", "WT"): 339,
+        ("-1", "WT", "-32", "-12"): 81,
+        ("-1", "WT", "-16", "-12"): 54,
+        ("-6", "WT", "-10", "-15"): 52,
+        ("-7", "WT", "WT", "-10"): 47,
+        ("-1", "WT", "-26", "-49"): 45,
+        ("-45", "WT", "WT", "WT"): 38,
+    })
+    _, mosaic = pick_haplotypes(merged, het_threshold_frac=0.20,
+                                mosaic_threshold_frac=0.10)
+    assert mosaic is True
+
+
+def test_pick_haplotypes_clean_het_not_flagged_as_mosaic():
+    # Clean het: WT and one edited haplotype both around 50%. The
+    # mosaic-on-one-chromosome check must not fire here.
+    merged = collections.Counter({
+        ("WT", "WT"): 50,
+        ("+1", "WT"): 50,
+    })
+    _, mosaic = pick_haplotypes(merged, het_threshold_frac=0.20,
+                                mosaic_threshold_frac=0.10)
+    assert mosaic is False
+
+
+def test_pick_haplotypes_het_with_minor_noise_not_flagged_as_mosaic():
+    # WT + dominant edit + a couple of minor edited tuples below het
+    # threshold. The dominant edit clears het threshold, so this is a
+    # clean het — not mosaic.
+    merged = collections.Counter({
+        ("WT", "WT"): 50,
+        ("+1", "WT"): 40,
+        ("-1", "WT"): 5,
+        ("-2", "WT"): 5,
+    })
+    _, mosaic = pick_haplotypes(merged, het_threshold_frac=0.20,
+                                mosaic_threshold_frac=0.10)
+    assert mosaic is False
 
 
 def test_pick_haplotypes_returns_one_when_homozygous():
@@ -134,6 +233,343 @@ def test_zygosity_lowN_when_no_haplotypes():
 def test_zygosity_mosaic_overrides_everything():
     tup = ("WT", "+1", "WT", "WT")
     assert _zygosity_call([tup, tup], is_homozygous=True, is_mosaic=True) == "mosaic"
+
+
+# ---- detect_per_guide_mosaic --------------------------------------------
+
+def _ac(top_frac: float, wt_frac: float, conf: str = "med") -> AlleleCall:
+    return AlleleCall(call="x", spanning=1000, top_frac=top_frac,
+                      second_frac=0.0, wt_frac=wt_frac, confidence=conf)
+
+
+def test_per_guide_mosaic_fires_on_two_fragmented_guides():
+    # WV151-2-4-7 pattern: gRNA3 and gRNA4 both have lots of editing
+    # but no dominant edited allele.
+    plant_calls = [
+        _ac(top_frac=30.35, wt_frac=42.22),  # gRNA1 — has dominant edit
+        _ac(top_frac=0.34, wt_frac=97.90),   # gRNA2 — clean WT
+        _ac(top_frac=7.87, wt_frac=67.22),   # gRNA3 — fragmented
+        _ac(top_frac=16.61, wt_frac=54.54),  # gRNA4 — fragmented
+    ]
+    assert detect_per_guide_mosaic(plant_calls, het_threshold=20.0) is True
+
+
+def test_per_guide_mosaic_does_not_fire_on_single_fragmented_guide():
+    # WV161-2-6-8 pattern: only gRNA4 is fragmented in the per-guide
+    # view; gRNA1 and gRNA3 both have dominant edited alleles.
+    plant_calls = [
+        _ac(top_frac=32.50, wt_frac=51.26),  # gRNA1 — dominant edit
+        _ac(top_frac=0.18, wt_frac=98.66),   # gRNA2 — clean WT
+        _ac(top_frac=35.84, wt_frac=51.73),  # gRNA3 — dominant edit
+        _ac(top_frac=12.37, wt_frac=66.10),  # gRNA4 — fragmented
+    ]
+    assert detect_per_guide_mosaic(plant_calls, het_threshold=20.0) is False
+
+
+def test_per_guide_mosaic_ignores_lowN_guides():
+    # A lowN guide with weird-looking numbers must not contribute to
+    # the fragmented-guide count.
+    plant_calls = [
+        _ac(top_frac=5.0, wt_frac=50.0, conf="lowN"),
+        _ac(top_frac=5.0, wt_frac=50.0, conf="lowN"),
+    ]
+    assert detect_per_guide_mosaic(plant_calls, het_threshold=20.0) is False
+
+
+def test_per_guide_mosaic_clean_het_at_every_guide_not_mosaic():
+    # All guides have a clean ~50/50 het signal — dominant edited
+    # allele clears the threshold everywhere. Not mosaic.
+    plant_calls = [
+        _ac(top_frac=48.0, wt_frac=50.0),
+        _ac(top_frac=48.0, wt_frac=50.0),
+        _ac(top_frac=48.0, wt_frac=50.0),
+    ]
+    assert detect_per_guide_mosaic(plant_calls, het_threshold=20.0) is False
+
+
+# ---- residual_non_wt_phased ---------------------------------------------
+
+def _phasing(
+    n_phased: int,
+    haplotypes: list[tuple],
+    all_tuples: list[tuple],
+) -> PhasingResult:
+    haps = [Haplotype(rank=i + 1, tuple_=t, details=[],
+                      support_reads=0, support_frac=0.0, description="")
+            for i, t in enumerate(haplotypes)]
+    return PhasingResult(
+        sample="x", n_phased=n_phased, n_partial=0, haplotypes=haps,
+        zygosity_call="x", is_mosaic=False, notes=[], all_tuples=all_tuples,
+    )
+
+
+def test_residual_non_wt_zero_for_clean_het():
+    # WV155-2-9 pattern: WT chromosome + edited chromosome, both called.
+    # No residual signal — Cas9 fired once and is done.
+    p = _phasing(
+        n_phased=706,
+        haplotypes=[("WT", "WT", "WT", "WT"), ("+1", "WT", "WT", "WT")],
+        all_tuples=[(("WT", "WT", "WT", "WT"), 442),
+                    (("+1", "WT", "WT", "WT"), 264)],
+    )
+    frac, reads = residual_non_wt_phased(p)
+    assert frac == 0.0
+    assert reads == 0
+
+
+def test_residual_non_wt_flags_small_subpopulation_in_wt_dominant():
+    # WV161-2-6-2 pattern: WT alone is the called chromosome, the
+    # 7% edited tuple is residual (Cas9 still active in some lineages).
+    # 78 reads of residual at n_phased=1115 — clears both 5% and 10-read floors.
+    p = _phasing(
+        n_phased=1115,
+        haplotypes=[("WT", "WT", "WT", "WT")],
+        all_tuples=[(("WT", "WT", "WT", "WT"), 1037),
+                    (("-1", "WT", "-24", "WT"), 78)],
+    )
+    frac, reads = residual_non_wt_phased(p)
+    assert abs(frac - 78 / 1115 * 100.0) < 1e-9
+    assert reads == 78
+
+
+def test_residual_non_wt_low_n_phased_returns_few_reads():
+    # 24-297-8 pattern: only 28 phased reads (95%+ went to partial-coverage),
+    # 3 of them carry an extra noise indel at gRNA4. Frac is 10.7% but only
+    # 3 absolute reads — caller (cli) requires both >=5% AND >=10 reads, so
+    # this should NOT trip Cas9+ at the call site.
+    p = _phasing(
+        n_phased=28,
+        haplotypes=[("-25", "WT", "WT", "WT")],
+        all_tuples=[(("-25", "WT", "WT", "WT"), 25),
+                    (("-25", "WT", "WT", "-2"), 3)],
+    )
+    frac, reads = residual_non_wt_phased(p)
+    assert abs(frac - 3 / 28 * 100.0) < 1e-9
+    assert reads == 3
+
+
+def test_residual_non_wt_zero_when_no_phased_reads():
+    p = _phasing(n_phased=0, haplotypes=[], all_tuples=[])
+    frac, reads = residual_non_wt_phased(p)
+    assert frac == 0.0
+    assert reads == 0
+
+
+def test_residual_non_wt_ignores_called_edited_tuples():
+    # A biallelic call where a minor tuple introduces an edit at a slot
+    # the called chromosomes don't touch (both calls are WT at slot 1).
+    # The minor tuple is a real new edit, not a noise variant.
+    p = _phasing(
+        n_phased=1000,
+        haplotypes=[("+1", "WT"), ("-1", "WT")],
+        all_tuples=[(("+1", "WT"), 480),
+                    (("-1", "WT"), 470),
+                    (("+1", "+1"), 50)],   # +1 at slot 1 is new
+    )
+    frac, reads = residual_non_wt_phased(p)
+    assert abs(frac - 5.0) < 1e-9
+    assert reads == 50
+
+
+def test_residual_non_wt_ignores_basecaller_variants_of_called_edit():
+    # crd4-plant4 pattern: called chromosome is WT/-2/WT/+1 (homozygous).
+    # The two minor tuples drop or swap the +1 at gRNA4 — both are
+    # nanopore homopolymer noise around the called +T, not new edits.
+    # Neither residual introduces a non-WT slot where the call is WT.
+    p = _phasing(
+        n_phased=101,
+        haplotypes=[("WT", "-2", "WT", "+1")],
+        all_tuples=[(("WT", "-2", "WT", "+1"), 91),
+                    (("WT", "-2", "WT", "WT"), 5),
+                    (("WT", "-2", "WT", "+2"), 5)],
+    )
+    frac, reads = residual_non_wt_phased(p)
+    assert frac == 0.0
+    assert reads == 0
+
+
+def test_residual_non_wt_ignores_dropped_edit_from_called():
+    # crd4-plant3 pattern: called WT/-2/WT/+1, residual WT/-2/WT/WT.
+    # Residual is the called chromosome with the +1 at gRNA4 dropped —
+    # a basecaller miscall at the homopolymer, not a real edit event.
+    p = _phasing(
+        n_phased=137,
+        haplotypes=[("WT", "-2", "WT", "+1")],
+        all_tuples=[(("WT", "-2", "WT", "+1"), 126),
+                    (("WT", "-2", "WT", "WT"), 11)],
+    )
+    frac, reads = residual_non_wt_phased(p)
+    assert frac == 0.0
+    assert reads == 0
+
+
+def test_residual_non_wt_noise_floor_suppresses_within_floor_signal():
+    # Residual claims a "new edit" at slot 0 (call is WT there) — but
+    # this sample's per-guide signal at slot 0 is 4%, below the batch
+    # noise floor of 8%. Discard as batch noise.
+    p = _phasing(
+        n_phased=1000,
+        haplotypes=[("WT", "WT")],
+        all_tuples=[(("WT", "WT"), 920),
+                    (("-1", "WT"), 80)],
+    )
+    frac, reads = residual_non_wt_phased(
+        p,
+        slot_signals=[4.0, 0.0],          # 4% at gRNA1 — below floor
+        slot_noise_floors=[8.0, 0.0],     # batch noise at gRNA1 is 8%
+    )
+    assert frac == 0.0
+    assert reads == 0
+
+
+def test_residual_non_wt_noise_floor_passes_above_floor_signal():
+    # Same shape as previous, but per-guide signal (15%) clears the
+    # batch noise floor (8%) — the residual is real Cas9 activity.
+    p = _phasing(
+        n_phased=1000,
+        haplotypes=[("WT", "WT")],
+        all_tuples=[(("WT", "WT"), 920),
+                    (("-1", "WT"), 80)],
+    )
+    frac, reads = residual_non_wt_phased(
+        p,
+        slot_signals=[15.0, 0.0],
+        slot_noise_floors=[8.0, 0.0],
+    )
+    assert reads == 80
+    assert abs(frac - 8.0) < 1e-9
+
+
+def test_residual_non_wt_noise_floor_optional():
+    # When floors aren't provided, behavior is unchanged from the
+    # no-floor version — the residual at slot 0 still counts.
+    p = _phasing(
+        n_phased=1000,
+        haplotypes=[("WT", "WT")],
+        all_tuples=[(("WT", "WT"), 920),
+                    (("-1", "WT"), 80)],
+    )
+    frac, reads = residual_non_wt_phased(p)
+    assert reads == 80
+
+
+# ---- per_guide_noise_floors ---------------------------------------------
+
+def test_noise_floors_returns_zero_when_too_few_clean_wt_samples():
+    # Only 2 high-confidence WT samples at gRNA1 — below the
+    # min_clean_samples=3 default → no floor learned.
+    plant_calls_per_sample = [
+        [AlleleCall("WT", 500, 1.0, 0.5, 99.0, "high")],
+        [AlleleCall("WT", 500, 2.0, 1.0, 98.0, "high")],
+        [AlleleCall("+T", 500, 95.0, 1.0, 4.0, "high")],
+    ]
+    floors = per_guide_noise_floors(plant_calls_per_sample, n_guides=1)
+    assert floors == [0.0]
+
+
+def test_noise_floors_learns_from_clean_wt_samples():
+    # Five high-confidence WT samples at gRNA1 with top_frac
+    # 1, 2, 3, 4, 6 → 90th percentile ≈ 6 → floor = 6 * 1.5 = 9.0.
+    plant_calls_per_sample = [
+        [AlleleCall("WT", 500, top, 0.5, 99.0 - top, "high")]
+        for top in (1.0, 2.0, 3.0, 4.0, 6.0)
+    ]
+    floors = per_guide_noise_floors(plant_calls_per_sample, n_guides=1)
+    assert abs(floors[0] - 6.0 * 1.5) < 1e-9
+
+
+def test_noise_floors_ignores_non_wt_calls_and_low_confidence():
+    # Six samples at gRNA1: only the 3 high-confidence WT samples
+    # contribute. The +T calls and the med/low WT calls are excluded.
+    plant_calls_per_sample = [
+        [AlleleCall("WT", 500, 1.0, 0.0, 99.0, "high")],
+        [AlleleCall("WT", 500, 2.0, 0.0, 98.0, "high")],
+        [AlleleCall("WT", 500, 3.0, 0.0, 97.0, "high")],
+        [AlleleCall("+T", 500, 90.0, 0.0, 9.0, "high")],
+        [AlleleCall("WT", 30, 5.0, 0.0, 95.0, "low")],
+        [AlleleCall("WT", 500, 8.0, 0.0, 92.0, "med")],
+    ]
+    floors = per_guide_noise_floors(plant_calls_per_sample, n_guides=1)
+    # 90th percentile of [1, 2, 3] is 3 → floor = 3 * 1.5 = 4.5.
+    assert abs(floors[0] - 3.0 * 1.5) < 1e-9
+
+
+def test_noise_floors_independent_per_guide():
+    # gRNA4 has noisy WT (homopolymer site); gRNA1 is quiet.
+    plant_calls_per_sample = [
+        [AlleleCall("WT", 500, 1.0, 0.0, 99.0, "high"),
+         AlleleCall("WT", 500, 5.0, 0.0, 95.0, "high")],
+        [AlleleCall("WT", 500, 2.0, 0.0, 98.0, "high"),
+         AlleleCall("WT", 500, 6.0, 0.0, 94.0, "high")],
+        [AlleleCall("WT", 500, 3.0, 0.0, 97.0, "high"),
+         AlleleCall("WT", 500, 7.0, 0.0, 93.0, "high")],
+    ]
+    floors = per_guide_noise_floors(plant_calls_per_sample, n_guides=2)
+    assert abs(floors[0] - 3.0 * 1.5) < 1e-9
+    assert abs(floors[1] - 7.0 * 1.5) < 1e-9
+
+
+# ---- per_guide_imputation -----------------------------------------------
+
+def test_per_guide_imputation_wt_high_confidence():
+    guides = [_g("gRNA1", 100)]
+    plant_calls = [AlleleCall("WT", 500, 0.5, 0.0, 99.5, "high")]
+    out = per_guide_imputation(plant_calls, guides, "ACGT" * 100)
+    assert out[0] is not None
+    assert out[0].label == "WT"
+
+
+def test_per_guide_imputation_homozygous_insertion_high_confidence():
+    guides = [_g("gRNA2", 200)]
+    plant_calls = [AlleleCall("+T", 500, 96.0, 0.5, 1.0, "high")]
+    out = per_guide_imputation(plant_calls, guides, "ACGT" * 100)
+    assert out[0] is not None
+    assert out[0].label == "+1"
+    assert out[0].ins_seq == "T"
+
+
+def test_per_guide_imputation_homozygous_deletion_high_confidence():
+    guides = [_g("gRNA1", 100)]
+    plant_calls = [AlleleCall("-CCC", 500, 95.0, 0.5, 2.0, "high")]
+    out = per_guide_imputation(plant_calls, guides, "ACGT" * 100)
+    assert out[0] is not None
+    assert out[0].label == "-3"
+
+
+def test_per_guide_imputation_het_call_returns_none():
+    # Het calls are ambiguous — we can't impute one of two chromosomes.
+    guides = [_g("gRNA1", 100)]
+    plant_calls = [AlleleCall("+T/WT", 500, 36.0, 0.5, 60.0, "low")]
+    out = per_guide_imputation(plant_calls, guides, "ACGT" * 100)
+    assert out[0] is None
+
+
+def test_per_guide_imputation_low_confidence_returns_none():
+    # Even a single-allele call gets dropped if confidence isn't high.
+    guides = [_g("gRNA1", 100)]
+    plant_calls = [AlleleCall("WT", 500, 5.0, 0.5, 95.0, "med")]
+    out = per_guide_imputation(plant_calls, guides, "ACGT" * 100)
+    assert out[0] is None
+
+
+def test_per_guide_imputation_lowN_returns_none():
+    guides = [_g("gRNA1", 100)]
+    plant_calls = [AlleleCall("lowN", 5, 0.0, 0.0, 0.0, "lowN")]
+    out = per_guide_imputation(plant_calls, guides, "ACGT" * 100)
+    assert out[0] is None
+
+
+def test_per_guide_imputation_independent_per_guide():
+    # Mixed: gRNA1 het (no impute), gRNA2 high-conf homozygous +T (impute).
+    guides = [_g("gRNA1", 100), _g("gRNA2", 200)]
+    plant_calls = [
+        AlleleCall("+T/WT", 500, 36.0, 0.5, 60.0, "low"),
+        AlleleCall("+T", 500, 96.0, 0.5, 1.0, "high"),
+    ]
+    out = per_guide_imputation(plant_calls, guides, "ACGT" * 100)
+    assert out[0] is None
+    assert out[1] is not None
+    assert out[1].label == "+1"
 
 
 # ---- _slot_description / render_haplotype_description -------------------

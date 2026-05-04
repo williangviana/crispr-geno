@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 from dataclasses import dataclass
+from math import ceil
 from typing import Optional
 
 import pysam
@@ -42,6 +43,74 @@ class AlleleCall:
     second_frac: float   # % of reads supporting the second-most-common non-WT signature
     wt_frac: float       # % of reads with no indel near the cut
     confidence: str      # 'high' | 'med' | 'low' | 'ambiguous' | 'lowN'
+    top_strand_pct: float = 50.0  # % of top-allele reads on the + strand
+                                  # (50 = balanced; <10 or >90 = strand bias)
+
+
+def detect_per_guide_mosaic(
+    plant_calls: list["AlleleCall"],
+    het_threshold: float = 20.0,
+    min_fragmented_guides: int = 2,
+) -> bool:
+    """True when ≥min_fragmented_guides show fragmented editing.
+
+    A guide is "fragmented" when its non-WT mass is meaningful
+    (>= het_threshold %) but no single edited allele clears the het
+    threshold — i.e. lots of editing spread across many distinct
+    lesions. This uses every read at each guide (not just reads that
+    span every guide), so it catches mosaicism the phaser misses.
+    """
+    n = sum(
+        1 for ac in plant_calls
+        if ac.confidence != "lowN"
+        and (100.0 - ac.wt_frac) >= het_threshold
+        and ac.top_frac < het_threshold
+    )
+    return n >= min_fragmented_guides
+
+
+def per_guide_noise_floors(
+    plant_calls_per_sample: list[list["AlleleCall"]],
+    n_guides: int,
+    min_clean_samples: int = 3,
+    margin: float = 1.5,
+) -> list[float]:
+    """Per-guide batch-specific noise floor (percent), one per guide.
+
+    For each guide G, take the top non-WT signal (top_frac) from every
+    sample whose per-guide call at G is high-confidence WT. The 90th
+    percentile of those values, multiplied by `margin`, is the noise
+    floor for G — any non-WT signal at G in any sample at or below
+    this floor is indistinguishable from batch noise.
+
+    Returns 0.0 for guides with fewer than `min_clean_samples` clean
+    WT samples (i.e. the batch doesn't have enough WT controls at that
+    site to learn a meaningful floor; fall back to no filtering).
+
+    Used by the phased-residual check to suppress false-positive Cas9+
+    calls at sites with consistent batch noise (e.g. a homopolymer
+    +1/-1 site that shows ~5% del1 in every sample).
+    """
+    floors: list[float] = []
+    for gi in range(n_guides):
+        clean_top_fracs = [
+            calls[gi].top_frac
+            for calls in plant_calls_per_sample
+            if gi < len(calls)
+            and calls[gi].call == "WT"
+            and calls[gi].confidence == "high"
+        ]
+        if len(clean_top_fracs) < min_clean_samples:
+            floors.append(0.0)
+            continue
+        # 90th percentile (nearest-rank): tolerant of one or two
+        # slightly-noisier samples without being dragged down by the
+        # median.
+        clean_top_fracs.sort()
+        idx = max(0, ceil(0.9 * len(clean_top_fracs)) - 1)
+        p90 = clean_top_fracs[idx]
+        floors.append(p90 * margin)
+    return floors
 
 
 def rc(s: str) -> str:
@@ -135,13 +204,16 @@ def align(ref_fa: str, fastq: str, bam_out: str, threads: int = 4) -> None:
 
 
 def count_indels(bam_path: str, ref_name: str, cut_pos: int,
-                 window: int, min_read_len: int) -> GuideCounts:
+                 window: int, min_read_len: int,
+                 min_mapq: int = 0) -> GuideCounts:
     """Count reads spanning the cut and their indels, broken out by size class."""
     bam = pysam.AlignmentFile(bam_path, "rb")
     span_start, span_end = cut_pos - window, cut_pos + window
     spanning = ins1 = del1 = ins_ge2 = del_ge2 = 0
     for read in bam.fetch(ref_name, max(0, span_start), span_end):
         if read.is_unmapped or read.is_secondary or read.is_supplementary:
+            continue
+        if read.mapping_quality < min_mapq:
             continue
         if read.query_length is not None and read.query_length < min_read_len:
             continue
@@ -176,8 +248,43 @@ def count_indels(bam_path: str, ref_name: str, cut_pos: int,
     return GuideCounts(spanning, ins1, del1, ins_ge2, del_ge2)
 
 
-def read_signature(read, cut_pos: int, window: int):
-    """Tuple of (('I'|'D', size, ref_pos), ...) near the cut and inserted seqs dict."""
+def _left_normalize_deletion(pos: int, length: int, ref_seq: str) -> int:
+    """Shift a deletion as far left as possible without changing what's
+    deleted. Standard VCF-style left-alignment: while the base just
+    before the deletion equals the last base of the deletion, slide
+    one position left. Collapses representations like del at pos N vs
+    pos N+k inside a homopolymer / tandem repeat into one canonical
+    position.
+    """
+    while pos > 0 and pos + length <= len(ref_seq):
+        if ref_seq[pos - 1] != ref_seq[pos + length - 1]:
+            break
+        pos -= 1
+    return pos
+
+
+def _left_normalize_insertion(pos: int, ins_seq: str, ref_seq: str) -> tuple[int, str]:
+    """Shift an insertion as far left as possible without changing what's
+    inserted. The inserted sequence rotates as we shift. Collapses
+    +T at pos N vs pos N+1 inside a TTTT homopolymer into one canonical
+    (pos, seq) pair.
+    """
+    if not ins_seq:
+        return pos, ins_seq
+    while pos > 0 and ref_seq[pos - 1] == ins_seq[-1]:
+        ins_seq = ins_seq[-1] + ins_seq[:-1]
+        pos -= 1
+    return pos, ins_seq
+
+
+def read_signature(read, cut_pos: int, window: int, ref_seq: str | None = None):
+    """Tuple of (('I'|'D', size, ref_pos), ...) near the cut and inserted seqs dict.
+
+    When ref_seq is provided, indels are left-normalized to a canonical
+    position so that homopolymer/repeat-context placements collapse
+    into the same allele. Without ref_seq, raw CIGAR positions are
+    used (legacy behaviour).
+    """
     pos = read.reference_start
     qpos = 0
     events = []
@@ -190,15 +297,27 @@ def read_signature(read, cut_pos: int, window: int):
             if pos < cut_pos + window and pos + length > cut_pos - window:
                 # keep all >=2bp; 1bp only if right at cut (suppresses Nanopore noise)
                 if length >= 2 or abs(pos - cut_pos) <= 1:
-                    events.append(("D", length, pos))
+                    norm_pos = (
+                        _left_normalize_deletion(pos, length, ref_seq)
+                        if ref_seq is not None else pos
+                    )
+                    events.append(("D", length, norm_pos))
             pos += length
         elif op == 1:  # I
             if cut_pos - window <= pos <= cut_pos + window:
                 if length >= 2 or abs(pos - cut_pos) <= 2:
-                    ev = ("I", length, pos)
+                    raw_ins = (read.query_sequence[qpos:qpos + length]
+                               if read.query_sequence else "")
+                    if ref_seq is not None and raw_ins:
+                        norm_pos, norm_ins = _left_normalize_insertion(
+                            pos, raw_ins, ref_seq,
+                        )
+                    else:
+                        norm_pos, norm_ins = pos, raw_ins
+                    ev = ("I", length, norm_pos)
                     events.append(ev)
-                    if read.query_sequence:
-                        ins_seqs[ev] = read.query_sequence[qpos:qpos + length]
+                    if norm_ins:
+                        ins_seqs[ev] = norm_ins
             qpos += length
         elif op == 4:
             qpos += length
@@ -213,23 +332,29 @@ _read_signature = read_signature
 
 def call_allele(bam_path: str, ref_name: str, ref_seq: str, cut_pos: int,
                 window: int, min_spanning: int, homo_threshold: float,
-                het_threshold: float, min_read_len: int) -> AlleleCall:
+                het_threshold: float, min_read_len: int,
+                min_mapq: int = 0) -> AlleleCall:
     """Extract the dominant allele sequence at a cut site."""
     bam = pysam.AlignmentFile(bam_path, "rb")
     win_s, win_e = cut_pos - window, cut_pos + window
     spanning = 0
     sig_counts: collections.Counter = collections.Counter()
+    sig_strand: dict = {}  # signature -> [plus_n, minus_n]
     ins_seq_store: dict = {}
     for read in bam.fetch(ref_name, max(0, win_s), win_e):
         if read.is_unmapped or read.is_secondary or read.is_supplementary:
+            continue
+        if read.mapping_quality < min_mapq:
             continue
         if read.query_length is not None and read.query_length < min_read_len:
             continue
         if read.reference_start > win_s or read.reference_end < win_e:
             continue
         spanning += 1
-        events, seqs = _read_signature(read, cut_pos, window)
+        events, seqs = _read_signature(read, cut_pos, window, ref_seq)
         sig_counts[events] += 1
+        bucket = sig_strand.setdefault(events, [0, 0])
+        bucket[1 if read.is_reverse else 0] += 1
         for ev, s in seqs.items():
             ins_seq_store.setdefault(ev, s)
     bam.close()
@@ -304,10 +429,18 @@ def call_allele(bam_path: str, ref_name: str, ref_seq: str, cut_pos: int,
 
     top_str = sig_str(top_sig)
 
+    # Strand balance for the top non-WT signature: % of supporting reads
+    # on the + strand. Severe bias (<10 or >90 with ≥10 reads) is a
+    # sequencing/alignment artifact signal, surfaced via Notes by cli.py.
+    plus, minus = sig_strand.get(top_sig, [0, 0])
+    top_strand_pct = (
+        100.0 * plus / (plus + minus) if (plus + minus) else 50.0
+    )
+
     # Homozygous mutant
     if top_frac >= homo_threshold:
         return AlleleCall(top_str, spanning, top_frac, second_frac, wt_frac,
-                          confidence_of(top_frac))
+                          confidence_of(top_frac), top_strand_pct)
 
     # Biallelic: two different mutant alleles each above het threshold, WT minor
     if len(non_wt) >= 2:
@@ -315,11 +448,12 @@ def call_allele(bam_path: str, ref_name: str, ref_seq: str, cut_pos: int,
         if second_frac >= het_threshold and wt_frac < het_threshold:
             return AlleleCall(f"{top_str}/{sig_str(second_sig)}",
                               spanning, top_frac, second_frac, wt_frac,
-                              confidence_of(top_frac))
+                              confidence_of(top_frac), top_strand_pct)
 
     # Heterozygous vs WT
     return AlleleCall(f"{top_str}/WT", spanning, top_frac, second_frac, wt_frac,
-                      confidence_of(top_frac, call_is_het_vs_wt=True))
+                      confidence_of(top_frac, call_is_het_vs_wt=True),
+                      top_strand_pct)
 
 
 def find_large_deletions(
@@ -332,6 +466,7 @@ def find_large_deletions(
     homo_threshold: float = 70.0,
     het_threshold: float = 20.0,
     min_supporting: int = 5,
+    min_mapq: int = 0,
 ) -> dict[tuple[int, int], dict]:
     """Find large deletions that span two cut sites (structural variants).
 
@@ -367,6 +502,8 @@ def find_large_deletions(
 
     for read in bam.fetch(ref_name):
         if read.is_unmapped or read.is_secondary or read.is_supplementary:
+            continue
+        if read.mapping_quality < min_mapq:
             continue
         if read.query_length is not None and read.query_length < min_read_len:
             continue

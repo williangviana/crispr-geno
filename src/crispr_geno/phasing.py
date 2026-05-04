@@ -66,16 +66,19 @@ class PhasingResult:
 
 # ---- Per-read classification --------------------------------------------
 
-def classify_read_at_guide(read, cut_pos: int, window: int) -> SlotDetail:
+def classify_read_at_guide(read, cut_pos: int, window: int,
+                           ref_seq: str | None = None) -> SlotDetail:
     """Classify one read's allele at one guide's cut site.
 
     Returns 'NC' if the read does not span the cut window (cannot phase
     this slot). Otherwise reuses read_signature() to find the largest
-    indel event near the cut.
+    indel event near the cut. When ref_seq is provided, indels are
+    left-normalized so equivalent placements (e.g. +T at pos N vs N+1
+    inside a TTTT homopolymer) cluster together.
     """
     if read.reference_start > cut_pos - window or read.reference_end < cut_pos + window:
         return SlotDetail("NC")
-    events, ins_seqs = read_signature(read, cut_pos, window)
+    events, ins_seqs = read_signature(read, cut_pos, window, ref_seq)
     if not events:
         return SlotDetail("WT")
     # If multiple events near the same cut, keep the largest by size.
@@ -117,40 +120,113 @@ def build_read_haplotypes(
     sv_results: dict[tuple[int, int], dict],
     window: int,
     min_read_len: int,
-) -> tuple[collections.Counter, dict[HaplotypeTuple, list[SlotDetail]], int]:
+    imputation: list[Optional[SlotDetail]] | None = None,
+    ref_seq: str | None = None,
+    min_mapq: int = 0,
+) -> tuple[collections.Counter, dict[HaplotypeTuple, list[SlotDetail]], int, int]:
     """Single pass over primary reads, producing:
       - a Counter of HaplotypeTuple
       - a dict of HaplotypeTuple -> representative per-slot details (first seen)
       - the number of reads dropped due to NC slots (partial coverage)
+      - the number of reads rescued from partial-coverage by imputation
+
+    `imputation` is an optional per-guide pre-imputed SlotDetail. When a
+    read has NC at slot i and imputation[i] is provided, the NC is filled
+    with imputation[i] instead of dropping the read. This rescues reads
+    that span only some of the guides — common for long amplicons or
+    reads from a chromosome with a large lesion that prevents spanning.
+
+    Imputation is only performed at slots where the per-guide caller
+    is unambiguously confident (computed by `per_guide_imputation()`),
+    so we never fabricate evidence at uncertain sites.
     """
     read_to_sv = _build_read_to_sv(sv_results)
+    use_impute = imputation is not None
 
     bam = pysam.AlignmentFile(bam_path, "rb")
     counter: collections.Counter = collections.Counter()
     details_store: dict[HaplotypeTuple, list[SlotDetail]] = {}
     n_partial = 0
+    n_imputed = 0
     try:
         for read in bam.fetch(ref_name):
             if read.is_unmapped or read.is_secondary or read.is_supplementary:
+                continue
+            if read.mapping_quality < min_mapq:
                 continue
             if read.query_length is not None and read.query_length < min_read_len:
                 continue
             sv_pair = read_to_sv.get(read.query_name)
             details: list[SlotDetail] = []
+            had_nc = False
             for i, g in enumerate(guides):
                 if sv_pair is not None and _guide_in_sv_span(i, sv_pair, guides):
                     details.append(SlotDetail("SV"))
                 else:
-                    details.append(classify_read_at_guide(read, g.cut_pos, window))
+                    d = classify_read_at_guide(read, g.cut_pos, window, ref_seq)
+                    if d.label == "NC":
+                        if use_impute and imputation[i] is not None:
+                            details.append(imputation[i])
+                            had_nc = True
+                        else:
+                            details.append(d)
+                    else:
+                        details.append(d)
             if any(d.label == "NC" for d in details):
                 n_partial += 1
                 continue
+            if had_nc:
+                n_imputed += 1
             tup = tuple(d.label for d in details)
             counter[tup] += 1
             details_store.setdefault(tup, details)
     finally:
         bam.close()
-    return counter, details_store, n_partial
+    return counter, details_store, n_partial, n_imputed
+
+
+def per_guide_imputation(
+    plant_calls: list[AlleleCall],
+    guides: list[Guide],
+    ref_seq: str,
+) -> list[Optional[SlotDetail]]:
+    """Per-guide SlotDetail to use when imputing NC slots in reads.
+
+    Returns one entry per guide. Conservative: only impute at guides
+    where the per-guide caller is **high confidence** AND the call is
+    a single allele (not a het, biallelic, or lowN). For high-confidence
+    WT calls we impute "WT"; for high-confidence single-edit calls we
+    impute the corresponding phased slot label.
+
+    Anything ambiguous (het, biallelic, mosaic-like, low coverage) gets
+    `None` — those slots stay NC and reads NC at them stay dropped.
+    """
+    out: list[Optional[SlotDetail]] = []
+    for i, ac in enumerate(plant_calls):
+        if ac.confidence != "high":
+            out.append(None)
+            continue
+        call = ac.call.strip()
+        if call == "WT":
+            out.append(SlotDetail("WT"))
+            continue
+        if "/" in call or call in ("lowN", ""):
+            out.append(None)
+            continue
+        # Single-allele edit call (e.g. "+T", "-CCC") — convert to a
+        # phased slot label and synthesize a SlotDetail. ref_pos is set
+        # to -1 (unknown) so the renderer falls back to size-only
+        # notation ('+Tbp', '-3bp') if no observed read populates the
+        # tuple first; we don't fabricate a position that might point
+        # at the wrong reference bases.
+        phased = _per_guide_label_to_phased(call)
+        if phased is None:
+            out.append(None)
+            continue
+        size = int(phased[1:])
+        ins_seq = call[1:] if call.startswith("+") else ""
+        out.append(SlotDetail(phased, size, ins_seq, -1))
+    return out
 
 
 # ---- Noise merging ------------------------------------------------------
@@ -197,7 +273,10 @@ def pick_haplotypes(
     """Pick the top 1-2 haplotypes from the merged Counter.
 
     Returns (top_tuples, is_mosaic). top_tuples has length 0, 1, or 2.
-    is_mosaic is True if 3+ tuples cross mosaic_threshold_frac.
+    is_mosaic is True if either 3+ tuples cross mosaic_threshold_frac, or
+    one chromosome reads as WT and the non-WT mass is fragmented across
+    3+ distinct lesions with no single edited tuple clearing the het
+    threshold (mosaic on one chromosome).
     """
     if not merged:
         return [], False
@@ -206,6 +285,23 @@ def pick_haplotypes(
 
     top = [(t, n) for t, n in ranked if n / total >= het_threshold_frac]
     is_mosaic = sum(1 for _, n in ranked if n / total >= mosaic_threshold_frac) >= 3
+
+    # Mosaic-on-one-chromosome: WT reads cleanly on one chromosome but the
+    # other chromosome's reads are fragmented across many distinct lesions
+    # (no single edited haplotype clears the het threshold). The 3-above-
+    # threshold check above misses this — typically only WT and the tallest
+    # edited tuple cross it. Detect it from the non-WT mass directly.
+    if not is_mosaic:
+        non_wt = [(t, n) for t, n in ranked if not all(s == "WT" for s in t)]
+        if non_wt:
+            non_wt_total = sum(n for _, n in non_wt)
+            non_wt_top = max(n for _, n in non_wt)
+            n_distinct = sum(1 for _, n in non_wt
+                             if n / total >= mosaic_threshold_frac / 2)
+            if (non_wt_total / total >= het_threshold_frac
+                    and non_wt_top / total < het_threshold_frac
+                    and n_distinct >= 3):
+                is_mosaic = True
 
     if not top:
         return [], is_mosaic
@@ -350,15 +446,26 @@ def phase_sample(
     noise_min_reads: int = 2,
     het_threshold_frac: float = 0.20,
     mosaic_threshold_frac: float = 0.10,
+    imputation: list[Optional[SlotDetail]] | None = None,
+    min_mapq: int = 0,
 ) -> PhasingResult:
-    """Run the full phasing pass for one sample."""
-    counter, details_store, n_partial = build_read_haplotypes(
+    """Run the full phasing pass for one sample.
+
+    `imputation` (optional, one entry per guide) lets reads that don't
+    span every guide still be phased, by filling in NC slots at sites
+    where the per-guide caller is unambiguously confident. See
+    `per_guide_imputation()` for how to derive it.
+    """
+    counter, details_store, n_partial, n_imputed = build_read_haplotypes(
         bam_path, ref_name, guides, sv_results, window, min_read_len,
+        imputation=imputation, ref_seq=ref_seq, min_mapq=min_mapq,
     )
     n_phased = sum(counter.values())
     notes: list[str] = []
     if n_partial:
         notes.append(f"partial-coverage:{n_partial}")
+    if n_imputed:
+        notes.append(f"imputed:{n_imputed}")
 
     if n_phased < min_spanning:
         return PhasingResult(
@@ -454,6 +561,75 @@ def _per_guide_label_to_phased(label: str) -> str | None:
         sign, seq = m.groups()
         return f"{sign}{len(seq)}"
     return None
+
+
+def residual_non_wt_phased(
+    result: "PhasingResult",
+    slot_signals: list[float] | None = None,
+    slot_noise_floors: list[float] | None = None,
+) -> tuple[float, int]:
+    """(percent, absolute reads) of phased reads carrying a haplotype
+    that introduces a *new* edit not present in any called chromosome.
+
+    A "new edit" means a slot where the residual haplotype is non-WT
+    but every called chromosome is WT. Variants of an existing called
+    edit (e.g. a +1 insertion at a homopolymer site getting basecalled
+    as WT in some reads, producing a residual that drops the +1) do
+    NOT count — they reflect per-base error around a fixed allele,
+    not new editing activity.
+
+    Optional cross-sample noise floors: if slot_signals (this sample's
+    per-guide top non-WT frac) and slot_noise_floors (per-guide batch
+    background, derived from confidently-WT samples) are both provided,
+    a "new edit" at slot i only counts when slot_signals[i] is above
+    slot_noise_floors[i]. This suppresses false positives at sites with
+    consistent batch noise — e.g. a homopolymer-prone guide showing 5%
+    del1 in every WT sample shouldn't mark a residual as Cas9 activity.
+
+    Examples (without floors):
+      called=(WT,WT,WT,WT), residual=(-1,WT,-24,WT)
+        → slots 0 and 2 carry edits the call lacks → counts (real Cas9+)
+
+      called=(WT,-2,WT,+1), residual=(WT,-2,WT,WT)
+        → only differs at slot 3 by *removing* +1 → no new edit → noise
+
+      called=(WT,-2,WT,+1), residual=(WT,-2,WT,+2)
+        → slot 3 is non-WT in both call and residual (variant of +1)
+        → no new edit → noise
+
+    Returns the absolute read count alongside the percent so callers
+    can require both a fractional bar AND a minimum absolute support
+    — at low n_phased a 5% bar can be tripped by 2-3 noise reads.
+    """
+    if not result.n_phased:
+        return 0.0, 0
+    called_tuples = [h.tuple_ for h in result.haplotypes]
+    called_set = set(called_tuples)
+    use_floors = slot_signals is not None and slot_noise_floors is not None
+
+    def has_new_edit(tup: HaplotypeTuple) -> bool:
+        for i, allele in enumerate(tup):
+            if allele == "WT":
+                continue
+            # New iff every called chromosome is WT at this slot. With
+            # no called chromosomes (lowN edge case) this is vacuously
+            # true, so any non-WT residual still counts.
+            if not all(c[i] == "WT" for c in called_tuples):
+                continue
+            # Cross-sample noise gate: even a "new edit" slot is
+            # discarded if its per-guide signal in this sample is
+            # within batch noise.
+            if use_floors and i < len(slot_signals) and i < len(slot_noise_floors):
+                if slot_signals[i] <= slot_noise_floors[i]:
+                    continue
+            return True
+        return False
+
+    residual = sum(
+        n for tup, n in result.all_tuples
+        if tup not in called_set and has_new_edit(tup)
+    )
+    return residual / result.n_phased * 100.0, residual
 
 
 def detect_phasing_mismatch(

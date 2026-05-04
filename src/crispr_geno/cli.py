@@ -16,10 +16,18 @@ from .analysis import (
     call_allele,
     check_tools,
     count_indels,
+    detect_per_guide_mosaic,
     find_large_deletions,
+    per_guide_noise_floors,
     resolve_guides,
 )
-from .phasing import detect_phasing_mismatch, per_guide_cells, phase_sample
+from .phasing import (
+    detect_phasing_mismatch,
+    per_guide_cells,
+    per_guide_imputation,
+    phase_sample,
+    residual_non_wt_phased,
+)
 from .xlsx import sequence_xlsx
 
 
@@ -279,6 +287,7 @@ def run_analysis(amplicon: str, guides: list[Guide], samples: list[Sample],
                  phasing_noise_frac: float = 0.05,
                  phasing_noise_min_reads: int = 2,
                  mosaic_threshold_frac: float = 0.10,
+                 min_mapq: int = 20,
                  legacy_output: bool = False) -> None:
     check_tools()
     os.makedirs(out_dir, exist_ok=True)
@@ -322,6 +331,21 @@ def run_analysis(amplicon: str, guides: list[Guide], samples: list[Sample],
     phased_conf_rows: list[list[str]] = []
     haplo_rows: list[list[str]] = []
 
+    # PASS 1: per-sample data collection. Per-guide calls, SV detection,
+    # and phasing are independent across samples — gather everything in
+    # memory so PASS 2 can score Status with batch-wide context (per-guide
+    # noise floors derived from confidently-WT samples).
+    @dataclass
+    class _SampleState:
+        s: Sample
+        bam: str
+        plant_calls: list[AlleleCall]
+        plant_guide_rates_rows: list[list[str]]
+        sv_results: dict
+        phasing: object  # PhasingResult
+
+    sample_states: list[_SampleState] = []
+
     for s in samples:
         if not os.path.exists(s.fastq):
             print(f"  SKIP {s.id}: {s.fastq} not found")
@@ -335,10 +359,11 @@ def run_analysis(amplicon: str, guides: list[Guide], samples: list[Sample],
         plant_calls: list[AlleleCall] = []
         plant_guide_rates_rows: list[list[str]] = []
         for g in guides:
-            c = count_indels(bam, ref_name, g.cut_pos, window, min_read_len)
+            c = count_indels(bam, ref_name, g.cut_pos, window, min_read_len,
+                             min_mapq=min_mapq)
             ac = call_allele(bam, ref_name, ref_seq, g.cut_pos, window,
                              min_spanning, homo_threshold, het_threshold,
-                             min_read_len)
+                             min_read_len, min_mapq=min_mapq)
             any_n = min(c.spanning, c.ins1 + c.del1 + c.ins_ge2 + c.del_ge2)
             ge2_n = min(c.spanning, c.ins_ge2 + c.del_ge2)
             plant_guide_rates_rows.append([
@@ -365,6 +390,7 @@ def run_analysis(amplicon: str, guides: list[Guide], samples: list[Sample],
             homo_threshold=homo_threshold,
             het_threshold=het_threshold,
             min_supporting=5,
+            min_mapq=min_mapq,
         )
         sv_results_per_plant.append((s.id, sv_results))
         for pair, info in sv_results.items():
@@ -380,12 +406,77 @@ def run_analysis(amplicon: str, guides: list[Guide], samples: list[Sample],
                 info["call"],
             ])
 
+        # Read-level haplotype phasing: one consolidated per-chromosome call
+        # per sample, plus the per-guide A1/A2 cells. Pass per-guide
+        # imputation so reads that don't span every guide can still be
+        # phased — at slots where the per-guide caller is unambiguously
+        # confident, NC is filled in. Big win for long amplicons where
+        # most reads physically can't span all guides.
+        imputation = per_guide_imputation(plant_calls, guides, ref_seq)
+        phasing = phase_sample(
+            s.id, bam, ref_name, ref_seq, guides, sv_results,
+            window=window, min_spanning=min_spanning,
+            min_read_len=min_read_len,
+            noise_frac=phasing_noise_frac,
+            noise_min_reads=phasing_noise_min_reads,
+            het_threshold_frac=het_threshold / 100.0,
+            mosaic_threshold_frac=mosaic_threshold_frac,
+            imputation=imputation,
+            min_mapq=min_mapq,
+        )
+        sample_states.append(_SampleState(
+            s=s, bam=bam, plant_calls=plant_calls,
+            plant_guide_rates_rows=plant_guide_rates_rows,
+            sv_results=sv_results, phasing=phasing,
+        ))
+
+    # Cross-sample noise floors: one per guide. Computed from samples
+    # confidently called WT at each guide — the typical "top non-WT"
+    # signal in those samples is the batch noise level for that guide.
+    # Used below to suppress phased-residual signals that match batch
+    # noise (e.g. homopolymer basecaller drift at one guide).
+    noise_floors = per_guide_noise_floors(
+        [st.plant_calls for st in sample_states], len(guides),
+    )
+    if any(f > 0.0 for f in noise_floors):
+        floor_summary = ", ".join(
+            f"{guides[i].name}={noise_floors[i]:.1f}%"
+            for i in range(len(guides)) if noise_floors[i] > 0.0
+        )
+        print(f"\nPer-guide batch noise floors: {floor_summary}")
+
+    # PASS 2: scoring with cross-sample floors, then row building.
+    for st in sample_states:
+        s = st.s
+        plant_calls = st.plant_calls
+        plant_guide_rates_rows = st.plant_guide_rates_rows
+        phasing = st.phasing
+
+        a1 = phasing.haplotypes[0].description if phasing.haplotypes else ""
+        a2 = (phasing.haplotypes[1].description if len(phasing.haplotypes) >= 2
+              else (phasing.haplotypes[0].description if phasing.haplotypes else ""))
+        per_guide = per_guide_cells(phasing, guides, ref_seq)
+
+        # Residual-editing signal from the phased view, gated by per-guide
+        # batch noise floors (see helper docstring).
+        slot_signals = [ac.top_frac for ac in plant_calls]
+        residual_non_wt_frac, residual_non_wt_reads = residual_non_wt_phased(
+            phasing, slot_signals=slot_signals, slot_noise_floors=noise_floors,
+        )
+
         # Per-plant status:
-        #   "Cas9+"  : at least one site shows the mosaic / residual-editing
-        #              signature (any ambiguous call)
-        #   "stable" : all sites are clean (WT / homo / het / lowN)
-        plant_status = "Cas9+" if any(ac.confidence == "ambiguous"
-                                       for ac in plant_calls) else "stable"
+        #   "Active Cas9"   : any per-guide ambiguous call OR a residual
+        #                     edited haplotype with both ≥5% of phased
+        #                     reads AND ≥10 supporting reads (the absolute
+        #                     floor prevents 2-3 noise reads from tripping
+        #                     the call when n_phased is small — partial-
+        #                     coverage drops can leave the phased view too
+        #                     sparse to trust on percentage alone)
+        #   "Inactive Cas9" : everything resolves cleanly
+        plant_status = "Active Cas9" if (
+            any(ac.confidence == "ambiguous" for ac in plant_calls)
+            or (residual_non_wt_frac >= 5.0 and residual_non_wt_reads >= 10)
+        ) else "Inactive Cas9"
 
         # Append Status column to every rates row for this plant
         for r in plant_guide_rates_rows:
@@ -395,44 +486,50 @@ def run_analysis(amplicon: str, guides: list[Guide], samples: list[Sample],
         # Per-plant base row (Status + per-guide calls). SV columns are appended
         # below, after we know which pairs to include.
         seq_rows.append([s.id, plant_status] + [ac.call for ac in plant_calls])
-        conf_rows.append(["ambiguous" if plant_status == "Cas9+" else ""] +
+        conf_rows.append(["ambiguous" if plant_status == "Active Cas9" else ""] +
                          [ac.confidence for ac in plant_calls])
 
-        # Read-level haplotype phasing: one consolidated per-chromosome call
-        # per sample, plus the per-guide A1/A2 cells.
-        phasing = phase_sample(
-            s.id, bam, ref_name, ref_seq, guides, sv_results,
-            window=window, min_spanning=min_spanning,
-            min_read_len=min_read_len,
-            noise_frac=phasing_noise_frac,
-            noise_min_reads=phasing_noise_min_reads,
-            het_threshold_frac=het_threshold / 100.0,
-            mosaic_threshold_frac=mosaic_threshold_frac,
-        )
-        a1 = phasing.haplotypes[0].description if phasing.haplotypes else ""
-        a2 = (phasing.haplotypes[1].description if len(phasing.haplotypes) >= 2
-              else (phasing.haplotypes[0].description if phasing.haplotypes else ""))
-        per_guide = per_guide_cells(phasing, guides, ref_seq)
-
-        # Cross-check: per-guide caller may have seen edits the phased
-        # view missed (typically when an SV chromosome dominates the
-        # phasable reads and the other chromosome's edits are stranded
-        # in partial-coverage). Promote the call if so.
+        # Het/biallelic decisions belong to the phased view only — phasing
+        # mismatch is recorded as a Note but does NOT promote the call.
         mismatch_notes = detect_phasing_mismatch(plant_calls, phasing, guides)
         zygosity_call = phasing.zygosity_call
-        if mismatch_notes:
-            if zygosity_call == "homozygous":
-                zygosity_call = "biallelic"
-            elif zygosity_call == "WT":
-                zygosity_call = "heterozygous"
-        all_notes = phasing.notes + mismatch_notes
+
+        # Total-read mosaic check: when ≥2 guides show fragmented editing
+        # in the per-guide caller (lots of editing, no dominant allele),
+        # the sample is mosaic regardless of what phasing concluded. This
+        # uses every read at each guide, not just reads that span every
+        # guide, so it catches mosaicism the phaser misses.
+        per_guide_mosaic = detect_per_guide_mosaic(plant_calls, het_threshold)
+        extra_notes: list[str] = []
+        if per_guide_mosaic:
+            zygosity_call = "mosaic"
+            if "mosaic" not in phasing.notes:
+                extra_notes.append("mosaic")
+
+        # Strand-bias flag: an edited allele whose supporting reads are
+        # almost all on one strand is a sequencing/alignment artifact,
+        # not biology. Surface it as a note so users can investigate.
+        for gi, ac in enumerate(plant_calls):
+            if ac.confidence in ("lowN", "ambiguous") or ac.call == "WT":
+                continue
+            top_n = int(round(ac.spanning * ac.top_frac / 100.0))
+            if top_n < 10:
+                continue
+            if ac.top_strand_pct < 10.0 or ac.top_strand_pct > 90.0:
+                extra_notes.append(
+                    f"strand-bias:{guides[gi].name}:{ac.top_strand_pct:.0f}%+"
+                )
+
+        all_notes = phasing.notes + extra_notes + mismatch_notes
 
         phased_rows.append(
             [s.id, plant_status, zygosity_call, a1, a2]
             + per_guide
             + [str(phasing.n_phased), ", ".join(all_notes)]
         )
-        ambig_flag = "ambiguous" if (phasing.is_mosaic or mismatch_notes) else ""
+        ambig_flag = "ambiguous" if (
+            phasing.is_mosaic or per_guide_mosaic or mismatch_notes
+        ) else ""
         phased_conf_rows.append(
             ["", "", ambig_flag, "", ""] + [""] * len(per_guide) + ["", ""]
         )
@@ -575,7 +672,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     # Thresholds / parameters
     p.add_argument("--window", type=int, default=5,
                    help="bp window on each side of the cut site.")
-    p.add_argument("--min-spanning", type=int, default=10,
+    p.add_argument("--min-spanning", type=int, default=30,
                    help="Minimum spanning reads required to call a genotype.")
     p.add_argument("--homo-threshold", type=float, default=70.0,
                    help="Percent threshold for a homozygous call.")
@@ -583,6 +680,9 @@ def main(argv: Optional[list[str]] = None) -> None:
                    help="Percent threshold for a heterozygous call.")
     p.add_argument("--min-read-len", type=int, default=200,
                    help="Minimum read length (bp) to include.")
+    p.add_argument("--min-mapq", type=int, default=20,
+                   help="Minimum mapping quality to include a read. "
+                        "20 corresponds to ~99%% alignment confidence.")
     p.add_argument("--threads", type=int, default=4,
                    help="Threads for minimap2 / samtools.")
 
@@ -689,6 +789,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         phasing_noise_frac=args.phasing_noise_frac,
         phasing_noise_min_reads=args.phasing_noise_min_reads,
         mosaic_threshold_frac=args.mosaic_threshold,
+        min_mapq=args.min_mapq,
         legacy_output=args.legacy_output,
     )
 

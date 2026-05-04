@@ -68,10 +68,11 @@ crispr-geno --input-dir /path/to/fastq_folder -o results/
 | Flag | Default | Purpose |
 |---|---:|---|
 | `--window` | 5 | bp each side of the cut where indels count |
-| `--min-spanning` | 10 | min reads spanning the cut to make a call |
+| `--min-spanning` | 30 | min reads spanning the cut to make a call |
 | `--homo-threshold` | 70 | % required for a homozygous call |
 | `--het-threshold` | 20 | % required for a het call |
 | `--min-read-len` | 200 | drop reads shorter than this |
+| `--min-mapq` | 20 | drop alignments below this mapping quality (~99% confidence) |
 | `--threads` | 4 | threads for minimap2 / samtools |
 | `--phasing-noise-frac` | 0.05 | merge haplotype tuples below this fraction into the nearest dominant tuple |
 | `--phasing-noise-min-reads` | 2 | minimum reads for a tuple to escape noise merging |

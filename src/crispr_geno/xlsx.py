@@ -91,9 +91,9 @@ def _pick_seq_fill(value: str) -> PatternFill | None:
     if value == "lowN":
         return PatternFill("solid", start_color="F4CCCC")  # light red — no data
     # Plant-level status values
-    if value == "stable":
+    if value == "Inactive Cas9":
         return PatternFill("solid", start_color="E7E6E6")  # light gray
-    if value == "Cas9+":
+    if value == "Active Cas9":
         return PatternFill("solid", start_color="E06666")  # saturated red — warning
     # Zygosity calls (blue gradient: lighter = less editing)
     if value == "homozygous":
@@ -152,9 +152,9 @@ def _pick_seq_fill(value: str) -> PatternFill | None:
 
 
 _LEGEND_LEGACY = [
-    ("stable",   "Status: all sites resolve cleanly — Cas9 likely inactive or absent",
+    ("Inactive Cas9", "Status: all sites resolve cleanly — no current editing signature in this amplicon",
         PatternFill("solid", start_color="E7E6E6")),
-    ("Cas9+",    "Status: at least one site shows mosaic / residual editing — Cas9 still active",
+    ("Active Cas9",   "Status: at least one site shows mosaic / residual editing — ongoing Cas9 activity",
         PatternFill("solid", start_color="E06666")),
     ("WT",       "wildtype — no edit detected at this site",
         PatternFill("solid", start_color="D9D9D9")),
@@ -194,9 +194,9 @@ _LEGEND_PHASED = [
     ("lowN",         "too few reads spanning the cut(s) to make a call",
         PatternFill("solid", start_color="F4CCCC")),
     # Plant-level status (Status column)
-    ("stable",       "Status column: all guides resolve cleanly — Cas9 appears inactive",
+    ("Inactive Cas9", "Status column: all guides resolve cleanly — no current editing signature",
         PatternFill("solid", start_color="E7E6E6")),
-    ("Cas9+",        "Status column: at least one guide shows ongoing editing",
+    ("Active Cas9",   "Status column: at least one guide shows ongoing editing",
         PatternFill("solid", start_color="E06666")),
     # Per-chromosome allele notation (Allele 1 / Allele 2 columns)
     ("SV:-Nbp",      "Allele 1/2: large deletion of N bp spanning two guide cuts",
