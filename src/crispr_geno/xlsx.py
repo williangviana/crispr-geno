@@ -237,7 +237,7 @@ def _write_sheet(ws, header, rows, conf_rows, legend_entries):
     for col_idx in range(2, ws.max_column + 1):
         header_val = ws.cell(1, col_idx).value
         if header_val == "Notes":
-            width = 35
+            width = 42
         elif header_val == "Phased reads":
             width = 14
         elif header_val in ("Status", "Zygosity call"):
