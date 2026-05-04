@@ -314,7 +314,12 @@ def read_signature(read, cut_pos: int, window: int, ref_seq: str | None = None):
                         )
                     else:
                         norm_pos, norm_ins = pos, raw_ins
-                    ev = ("I", length, norm_pos)
+                    # Include inserted sequence in the event key — two
+                    # insertions of the same length at the same position
+                    # but with different bases (e.g. +A vs +T) are
+                    # different alleles and must not collapse into one
+                    # signature.
+                    ev = ("I", length, norm_pos, norm_ins)
                     events.append(ev)
                     if norm_ins:
                         ins_seqs[ev] = norm_ins
@@ -416,9 +421,13 @@ def call_allele(bam_path: str, ref_name: str, ref_seq: str, cut_pos: int,
         return AlleleCall("WT", spanning, top_frac, second_frac, wt_frac, conf)
 
     def event_str(ev):
-        t, sz, p = ev
+        t = ev[0]
+        sz = ev[1]
+        p = ev[2]
         if t == "I":
-            seq = ins_seq_store.get(ev, "N" * sz)
+            # Insertion event tuples carry the inserted sequence as ev[3];
+            # fall back to ins_seq_store when not present (legacy form).
+            seq = ev[3] if len(ev) >= 4 and ev[3] else ins_seq_store.get(ev, "N" * sz)
             return f"+{seq}"
         else:
             seq = ref_seq[p:p + sz]

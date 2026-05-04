@@ -20,6 +20,12 @@ import pysam
 from .analysis import AlleleCall, Guide, read_signature
 
 
+# Canonical sequence-aware indel label: '+T', '-CCC', '+ATG'. Used both
+# by the phased view (HaplotypeTuple keys) and by the per-guide caller's
+# `call` field, so the two vocabularies match without conversion.
+_INDEL_RE = re.compile(r"^([+-])([ACGT]+)$", re.IGNORECASE)
+
+
 # ---- Types --------------------------------------------------------------
 
 # Slot label vocabulary used as the canonical clustering key.
@@ -75,6 +81,14 @@ def classify_read_at_guide(read, cut_pos: int, window: int,
     indel event near the cut. When ref_seq is provided, indels are
     left-normalized so equivalent placements (e.g. +T at pos N vs N+1
     inside a TTTT homopolymer) cluster together.
+
+    The returned label is sequence-aware when sequence info is
+    available: '+T' / '-CCC' rather than '+1' / '-3'. This is what
+    HaplotypeTuple uses as its clustering key, so two distinct alleles
+    of the same size (e.g. +A on one chromosome, +T on the other) no
+    longer collapse into the same haplotype. Falls back to size-only
+    notation ('+1', '-3') when sequence is unknowable (no read bases,
+    no ref_seq).
     """
     if read.reference_start > cut_pos - window or read.reference_end < cut_pos + window:
         return SlotDetail("NC")
@@ -83,11 +97,20 @@ def classify_read_at_guide(read, cut_pos: int, window: int,
         return SlotDetail("WT")
     # If multiple events near the same cut, keep the largest by size.
     largest = max(events, key=lambda e: e[1])
-    t, sz, p = largest
-    sign = "+" if t == "I" else "-"
-    label = f"{sign}{sz}"
-    ins_seq = ins_seqs.get(largest, "") if t == "I" else ""
-    return SlotDetail(label, sz, ins_seq, p)
+    t = largest[0]
+    sz = largest[1]
+    p = largest[2]
+    if t == "I":
+        # Insertion event tuples may carry the inserted sequence as
+        # the 4th element; fall back to ins_seqs lookup otherwise.
+        ins_seq = (largest[3] if len(largest) >= 4 and largest[3]
+                   else ins_seqs.get(largest, ""))
+        label = f"+{ins_seq}" if ins_seq else f"+{sz}"
+        return SlotDetail(label, sz, ins_seq, p)
+    # Deletion: derive deleted sequence from ref_seq when available.
+    del_seq = ref_seq[p:p + sz] if (ref_seq is not None and 0 <= p) else ""
+    label = f"-{del_seq}" if del_seq else f"-{sz}"
+    return SlotDetail(label, sz, "", p)
 
 
 def _guide_in_sv_span(guide_idx: int, sv_pair: tuple[int, int],
@@ -213,19 +236,19 @@ def per_guide_imputation(
         if "/" in call or call in ("lowN", ""):
             out.append(None)
             continue
-        # Single-allele edit call (e.g. "+T", "-CCC") — convert to a
-        # phased slot label and synthesize a SlotDetail. ref_pos is set
-        # to -1 (unknown) so the renderer falls back to size-only
-        # notation ('+Tbp', '-3bp') if no observed read populates the
-        # tuple first; we don't fabricate a position that might point
-        # at the wrong reference bases.
-        phased = _per_guide_label_to_phased(call)
-        if phased is None:
+        # Single-allele edit call (e.g. "+T", "-CCC") — the per-guide
+        # call string IS already in sequence-aware notation, which
+        # matches the phased slot labels emitted by classify_read_at_guide.
+        # Use it directly. ref_pos = -1 (unknown) so the renderer can
+        # tell this is an imputed slot.
+        m = _INDEL_RE.match(call)
+        if not m:
             out.append(None)
             continue
-        size = int(phased[1:])
-        ins_seq = call[1:] if call.startswith("+") else ""
-        out.append(SlotDetail(phased, size, ins_seq, -1))
+        sign, seq = m.groups()
+        size = len(seq)
+        ins_seq = seq if sign == "+" else ""
+        out.append(SlotDetail(call, size, ins_seq, -1))
     return out
 
 
@@ -350,15 +373,25 @@ def _slot_description(detail: SlotDetail, guide_name: str, ref_seq: str) -> str:
 
     'WT' returns ''. SV slots aren't rendered here — collapsed at the
     haplotype level by render_haplotype_description.
+
+    Labels are sequence-aware ('+T', '-CCC') in normal operation; the
+    renderer also handles the size-only fallback ('+1', '-3') by
+    appending 'bp' or extracting the sequence from ref_seq when
+    possible.
     """
     if detail.label in ("WT", "NC", "SV"):
         return ""
-    if detail.label.startswith("+"):
-        if detail.ins_seq:
+    if detail.label.startswith(("+", "-")):
+        suffix = detail.label[1:]
+        if suffix and not suffix.isdigit():
+            # Sequence-aware label — already canonical, use as-is.
+            return f"{guide_name}:{detail.label}"
+        # Size-only fallback. For deletions try to recover the sequence
+        # from ref_seq; for insertions use ins_seq if present.
+        if detail.label.startswith("+") and detail.ins_seq:
             return f"{guide_name}:+{detail.ins_seq}"
-        return f"{guide_name}:{detail.label}bp"
-    if detail.label.startswith("-"):
-        if 0 <= detail.ref_pos and detail.size > 0:
+        if (detail.label.startswith("-")
+                and 0 <= detail.ref_pos and detail.size > 0):
             seq = ref_seq[detail.ref_pos:detail.ref_pos + detail.size]
             if seq:
                 return f"{guide_name}:-{seq}"
@@ -417,12 +450,16 @@ def _slot_short(detail: SlotDetail, ref_seq: str) -> str:
         return "WT"
     if detail.label == "NC":
         return "?"
-    if detail.label.startswith("+"):
-        if detail.ins_seq:
+    if detail.label.startswith(("+", "-")):
+        suffix = detail.label[1:]
+        if suffix and not suffix.isdigit():
+            # Sequence-aware label — already canonical.
+            return detail.label
+        # Size-only fallback.
+        if detail.label.startswith("+") and detail.ins_seq:
             return f"+{detail.ins_seq}"
-        return detail.label + "bp"
-    if detail.label.startswith("-"):
-        if 0 <= detail.ref_pos and detail.size > 0:
+        if (detail.label.startswith("-")
+                and 0 <= detail.ref_pos and detail.size > 0):
             seq = ref_seq[detail.ref_pos:detail.ref_pos + detail.size]
             if seq:
                 return f"-{seq}"
@@ -550,12 +587,15 @@ def per_guide_cells(result: PhasingResult, guides: list[Guide], ref_seq: str) ->
 
 # ---- Cross-check: per-guide caller vs phased haplotypes ----------------
 
-_INDEL_RE = re.compile(r"^([+-])([ACGT]+)$", re.IGNORECASE)
-
-
 def _per_guide_label_to_phased(label: str) -> str | None:
-    """Map a per-guide caller's allele label ('+T', '-CCC') to a phased
-    slot label ('+1', '-3'). Returns None for SV / WT / unparseable."""
+    """Map a per-guide caller's allele label ('+T', '-CCC') to a size-only
+    fallback ('+1', '-3'). Returns None for SV / WT / unparseable.
+
+    Phased labels are now sequence-aware (matching per-guide directly),
+    so this helper is only used as a *fallback comparison* in the rare
+    case where the phased view stored a size-only label (e.g. read had
+    no query_sequence). Direct label comparison is preferred.
+    """
     m = _INDEL_RE.match(label)
     if m:
         sign, seq = m.groups()
@@ -670,7 +710,13 @@ def detect_phasing_mismatch(
             if part in ("WT", "", "lowN") or part.startswith("SV"):
                 continue
             phased_eq = _per_guide_label_to_phased(part)
-            if phased_eq is None or phased_eq in slots:
+            if phased_eq is None:
+                continue
+            # Direct match (sequence-aware) is the primary check; the
+            # size-only fallback covers the rare case where the phased
+            # view stored a size-only label (e.g. read had no
+            # query_sequence).
+            if part in slots or phased_eq in slots:
                 continue
             # Same-lesion guard: a guide inside an SV span shows 'SV' in
             # the phased view, but the per-guide caller (which doesn't

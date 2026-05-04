@@ -287,6 +287,42 @@ def test_per_guide_mosaic_clean_het_at_every_guide_not_mosaic():
     assert detect_per_guide_mosaic(plant_calls, het_threshold=20.0) is False
 
 
+# ---- sequence-aware allele identity (fix for +A vs +T collapse bug) -----
+
+def test_phased_haplotype_distinguishes_same_size_different_seq_insertions():
+    # Biallelic plant: chromosome A has +A at gRNA2, chromosome B has
+    # +T at gRNA2. Under the old size-only labeling both became '+1'
+    # and clustered as one homozygous '+1' chromosome. With sequence-
+    # aware labels they stay distinct as '+A' and '+T'.
+    counter = collections.Counter({
+        ("WT", "+A", "WT"): 50,
+        ("WT", "+T", "WT"): 50,
+    })
+    top, mosaic = pick_haplotypes(counter, het_threshold_frac=0.20,
+                                  mosaic_threshold_frac=0.10)
+    assert ("WT", "+A", "WT") in top
+    assert ("WT", "+T", "WT") in top
+    a, b = top
+    assert _zygosity_call([a, b], is_homozygous=False, is_mosaic=False) == "biallelic"
+
+
+def test_phased_haplotype_distinguishes_same_size_different_seq_deletions():
+    # Same idea for deletions: -CCC and -GGG at the same guide collapse
+    # to '-3' under size-only labels but stay distinct under sequence-
+    # aware ones.
+    counter = collections.Counter({
+        ("-CCC", "WT"): 60,
+        ("-GGG", "WT"): 40,
+    })
+    top, mosaic = pick_haplotypes(counter, het_threshold_frac=0.20,
+                                  mosaic_threshold_frac=0.10)
+    assert ("-CCC", "WT") in top
+    assert ("-GGG", "WT") in top
+    a, b = top
+    # Two different mutant alleles, neither is WT — biallelic.
+    assert _zygosity_call([a, b], is_homozygous=False, is_mosaic=False) == "biallelic"
+
+
 # ---- residual_non_wt_phased ---------------------------------------------
 
 def _phasing(
@@ -520,11 +556,13 @@ def test_per_guide_imputation_wt_high_confidence():
 
 
 def test_per_guide_imputation_homozygous_insertion_high_confidence():
+    # Sequence-aware label: '+T', not '+1' — so a +A on one chromosome
+    # and a +T on another don't collapse into the same haplotype.
     guides = [_g("gRNA2", 200)]
     plant_calls = [AlleleCall("+T", 500, 96.0, 0.5, 1.0, "high")]
     out = per_guide_imputation(plant_calls, guides, "ACGT" * 100)
     assert out[0] is not None
-    assert out[0].label == "+1"
+    assert out[0].label == "+T"
     assert out[0].ins_seq == "T"
 
 
@@ -533,7 +571,7 @@ def test_per_guide_imputation_homozygous_deletion_high_confidence():
     plant_calls = [AlleleCall("-CCC", 500, 95.0, 0.5, 2.0, "high")]
     out = per_guide_imputation(plant_calls, guides, "ACGT" * 100)
     assert out[0] is not None
-    assert out[0].label == "-3"
+    assert out[0].label == "-CCC"
 
 
 def test_per_guide_imputation_het_call_returns_none():
@@ -569,7 +607,7 @@ def test_per_guide_imputation_independent_per_guide():
     out = per_guide_imputation(plant_calls, guides, "ACGT" * 100)
     assert out[0] is None
     assert out[1] is not None
-    assert out[1].label == "+1"
+    assert out[1].label == "+T"
 
 
 # ---- _slot_description / render_haplotype_description -------------------
