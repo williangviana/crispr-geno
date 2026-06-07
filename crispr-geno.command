@@ -7,21 +7,25 @@
 
 set -e
 
-# Activate the dedicated conda env
-CONDA_BASE="/opt/homebrew/Caskroom/miniconda/base"
-if [ ! -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
-    # Fallback for Intel Macs with /usr/local miniconda
-    CONDA_BASE="$HOME/miniconda3"
-fi
-if [ ! -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
-    echo "ERROR: could not find conda. Edit this file and set CONDA_BASE to your miniconda/anaconda path."
+# Activate the venv that install.sh created next to this script.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+VENV_ACTIVATE="$SCRIPT_DIR/.venv/bin/activate"
+
+if [ -f "$VENV_ACTIVATE" ]; then
+    # shellcheck disable=SC1090
+    source "$VENV_ACTIVATE"
+elif command -v crispr-geno >/dev/null 2>&1; then
+    : # fall through — crispr-geno is already on PATH (e.g. ~/.local/bin)
+else
+    echo "ERROR: could not find the crispr-geno install."
+    echo "Expected a virtual environment at: $VENV_ACTIVATE"
+    echo "Reinstall by running:"
+    echo "  curl -fsSL https://raw.githubusercontent.com/williangviana/crispr-geno/stable/install/install.sh | bash"
+    echo
     echo "Press Return to close."
     read _
     exit 1
 fi
-
-source "$CONDA_BASE/etc/profile.d/conda.sh"
-conda activate crispr-geno
 
 clear
 cat <<'BANNER'
